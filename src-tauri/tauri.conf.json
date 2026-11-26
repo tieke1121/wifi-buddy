@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Wi-Fi 小管家",
+  "productName": "Wi-Fi Buddy",
   "version": "0.1.0",
   "identifier": "com.wifibuddy.app",
   "build": {

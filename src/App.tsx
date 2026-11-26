@@ -5,23 +5,27 @@ import QRCode from "qrcode";
 import {
   Activity,
   AlertTriangle,
+  ArrowUpRight,
+  Check,
   CheckCircle2,
   Copy,
   Eye,
   EyeOff,
-  ExternalLink,
   KeyRound,
   Laptop,
+  Lock,
   Pencil,
   Radar,
   RefreshCw,
   Router,
   Search,
-  Settings,
+  Settings2,
   ShieldCheck,
   Smartphone,
+  Sparkles,
   Tv,
   Wifi,
+  X,
 } from "lucide-react";
 import type {
   DeviceView,
@@ -34,12 +38,28 @@ import type {
 type TabId = "devices" | "share" | "health" | "router";
 type DeviceFilter = "all" | "new" | "personal" | "iot" | "blocked";
 
-function signalText(dbm: number | null): string {
-  if (dbm === null) return "信号未知";
-  if (dbm >= -55) return "信号极佳";
-  if (dbm >= -68) return "信号良好";
-  if (dbm >= -78) return "信号一般";
-  return "信号偏弱";
+function getSignalMeta(dbm: number | null) {
+  if (dbm === null) return { label: "信号检测中", bars: 2, color: "text-slate-400" };
+  if (dbm >= -55) return { label: "信号极佳", bars: 4, color: "text-emerald-500" };
+  if (dbm >= -67) return { label: "信号良好", bars: 3, color: "text-emerald-500" };
+  if (dbm >= -77) return { label: "信号一般", bars: 2, color: "text-amber-500" };
+  return { label: "信号偏弱", bars: 1, color: "text-rose-500" };
+}
+
+function SignalBars({ bars }: { bars: number }) {
+  return (
+    <div className="flex items-end gap-0.5 h-3.5" aria-hidden="true">
+      {[1, 2, 3, 4].map((lvl) => (
+        <span
+          key={lvl}
+          className={`w-1 rounded-full transition-colors ${
+            lvl <= bars ? "bg-emerald-500" : "bg-slate-200 dark:bg-zinc-700"
+          }`}
+          style={{ height: `${lvl * 25}%` }}
+        />
+      ))}
+    </div>
+  );
 }
 
 function DeviceIcon({ type }: { type: string }) {
@@ -68,27 +88,26 @@ export function App() {
   const [renamingDevice, setRenamingDevice] = useState<DeviceView | null>(null);
   const [renameInput, setRenameInput] = useState("");
 
-  // Wi-Fi 分享与密码
+  // 分享与密码
   const [selectedSsid, setSelectedSsid] = useState("");
   const [wifiPassword, setWifiPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [readingPw, setReadingPw] = useState(false);
+  const [copied, setCopied] = useState(false);
   const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // 一键体检
+  // 体检
   const [health, setHealth] = useState<HealthReport | null>(null);
   const [checkingHealth, setCheckingHealth] = useState(false);
 
-  // 全局提示
+  // Toast
   const [toast, setToast] = useState<string | null>(null);
 
-  const notify = (msg: string) => {
-    setToast(msg);
-  };
+  const notify = (msg: string) => setToast(msg);
 
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(null), 4000);
+    const t = setTimeout(() => setToast(null), 3500);
     return () => clearTimeout(t);
   }, [toast]);
 
@@ -102,7 +121,7 @@ export function App() {
       const res = await invoke<ScanResponse>("scan_devices");
       setScan(res);
     } catch (e) {
-      notify(`读取网络失败：${String(e)}`);
+      notify(`读取网络信息失败：${String(e)}`);
     } finally {
       setScanning(false);
     }
@@ -112,7 +131,6 @@ export function App() {
     loadOverviewAndScan();
   }, []);
 
-  // 绘制扫码连 Wi-Fi 二维码
   useEffect(() => {
     const canvas = qrCanvasRef.current;
     if (!canvas || !selectedSsid.trim()) return;
@@ -122,7 +140,7 @@ export function App() {
       : `WIFI:T:nopass;S:${escapeField(selectedSsid)};;`;
     QRCode.toCanvas(canvas, payload, {
       width: 176,
-      margin: 2,
+      margin: 1,
       color: { dark: "#0f172a", light: "#ffffff" },
     }).catch(() => {});
   }, [selectedSsid, wifiPassword, activeTab]);
@@ -132,7 +150,7 @@ export function App() {
     try {
       const res = await invoke<ScanResponse>("scan_devices");
       setScan(res);
-      notify(`扫描完成：当前局域网在线 ${res.total_clients} 台终端`);
+      notify(`扫描完成，当前共有 ${res.total_clients} 台终端在线`);
     } catch (e) {
       notify(`扫描出错：${String(e)}`);
     } finally {
@@ -150,16 +168,12 @@ export function App() {
         blocked: null,
       });
       setRenamingDevice(null);
-      await handleRescanOnlyMetaRefresh();
-      notify(`已备注为「${renameInput.trim() || renamingDevice.default_name}」`);
+      const res = await invoke<ScanResponse>("scan_devices");
+      setScan(res);
+      notify(`已将设备备注为「${renameInput.trim() || renamingDevice.default_name}」`);
     } catch (e) {
       notify(`保存失败：${String(e)}`);
     }
-  }
-
-  async function handleRescanOnlyMetaRefresh() {
-    const res = await invoke<ScanResponse>("scan_devices");
-    setScan(res);
   }
 
   async function handleTrustDevice(d: DeviceView) {
@@ -170,7 +184,8 @@ export function App() {
         trusted: true,
         blocked: false,
       });
-      await handleRescanOnlyMetaRefresh();
+      const res = await invoke<ScanResponse>("scan_devices");
+      setScan(res);
       notify(`已将「${d.display_name}」标为熟人设备`);
     } catch (e) {
       notify(`操作失败：${String(e)}`);
@@ -185,8 +200,9 @@ export function App() {
         trusted: null,
         blocked,
       });
-      await handleRescanOnlyMetaRefresh();
-      notify(blocked ? `已将「${d.display_name}」加入本地关注/屏蔽列表` : `已恢复「${d.display_name}」显示`);
+      const res = await invoke<ScanResponse>("scan_devices");
+      setScan(res);
+      notify(blocked ? `已隐藏「${d.display_name}」` : `已恢复显示「${d.display_name}」`);
     } catch (e) {
       notify(`操作失败：${String(e)}`);
     }
@@ -194,7 +210,7 @@ export function App() {
 
   async function handleReadSavedPassword() {
     if (!selectedSsid.trim()) {
-      notify("请先输入或选择当前的 Wi-Fi 名称");
+      notify("请先选择或输入当前的 Wi-Fi 名称");
       return;
     }
     setReadingPw(true);
@@ -205,7 +221,7 @@ export function App() {
       if (res.password) {
         setWifiPassword(res.password);
         setShowPassword(true);
-        notify(`已成功读取「${res.ssid}」的保存密码`);
+        notify(`已读取「${res.ssid}」的保存密码`);
       } else {
         notify(res.error || "未能读取到密码，请手动输入");
       }
@@ -221,7 +237,6 @@ export function App() {
     try {
       const report = await invoke<HealthReport>("run_health_check");
       setHealth(report);
-      notify("网络体检完成");
     } catch (e) {
       notify(`体检失败：${String(e)}`);
     } finally {
@@ -247,8 +262,12 @@ export function App() {
       ? `Wi-Fi 名称：${selectedSsid}\nWi-Fi 密码：${wifiPassword}`
       : `Wi-Fi 名称：${selectedSsid}（无密码）`;
     navigator.clipboard.writeText(text).then(
-      () => notify("已复制 Wi-Fi 信息，可以直接去微信粘贴发送"),
-      () => notify("复制失败，请手动选中复制")
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+        notify("已复制到剪贴板，去微信直接粘贴即可");
+      },
+      () => notify("复制失败，请手动复制")
     );
   }
 
@@ -273,375 +292,447 @@ export function App() {
     });
   }, [scan, filter, search]);
 
-  const personalCount = useMemo(() => {
-    return (scan?.devices ?? []).filter(
-      (d) => !d.is_gateway && !d.blocked && (d.device_type === "phone" || d.device_type === "laptop")
-    ).length;
-  }, [scan]);
+  const personalCount = useMemo(
+    () =>
+      (scan?.devices ?? []).filter(
+        (d) => !d.is_gateway && !d.blocked && (d.device_type === "phone" || d.device_type === "laptop")
+      ).length,
+    [scan]
+  );
 
-  const iotCount = useMemo(() => {
-    return (scan?.devices ?? []).filter(
-      (d) => !d.is_gateway && !d.blocked && d.device_type !== "phone" && d.device_type !== "laptop"
-    ).length;
-  }, [scan]);
+  const iotCount = useMemo(
+    () =>
+      (scan?.devices ?? []).filter(
+        (d) => !d.is_gateway && !d.blocked && d.device_type !== "phone" && d.device_type !== "laptop"
+      ).length,
+    [scan]
+  );
+
+  const sigMeta = getSignalMeta(overview?.signal_dbm ?? null);
+
+  const tabMeta: Record<TabId, { title: string; subtitle: string }> = {
+    devices: {
+      title: "谁在用我的网",
+      subtitle: overview
+        ? `子网 ${overview.subnet_cidr} · 已为你自动识别品牌与隐私随机地址`
+        : "正在扫描局域网活跃设备...",
+    },
+    share: {
+      title: "扫码连网与改密码",
+      subtitle: "读取本机保存的密码生成亲友二维码，或一键前往路由器修改密码",
+    },
+    health: {
+      title: "一键网络体检",
+      subtitle: "快速定位卡顿源头：信号弱、带宽被占还是外网宽带故障",
+    },
+    router: {
+      title: "路由器与版本说明",
+      subtitle: "自动识别网关型号，了解 V0.1 通用能力与后续控制规划",
+    },
+  };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <div className="max-w-6xl mx-auto p-4 md:p-6 space-y-4">
-        {/* 顶部栏 */}
-        <header className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center shrink-0">
+    <div className="h-screen w-screen flex bg-[#f4f5f7] text-slate-900 dark:bg-[#0d0f14] dark:text-zinc-100 select-none overflow-hidden">
+      {/* 左侧 macOS 风格边栏 */}
+      <aside className="w-60 shrink-0 border-r border-slate-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/70 backdrop-blur-xl flex flex-col justify-between p-4">
+        <div className="space-y-6">
+          {/* Brand */}
+          <div className="flex items-center gap-3 px-1">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white flex items-center justify-center shadow-sm shadow-blue-500/25 shrink-0">
               <Wifi className="w-5 h-5" />
             </div>
-            <div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <h1 className="text-base font-bold">Wi-Fi 小管家</h1>
-                <span className="text-xs px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300 font-medium">
-                  {overview?.router.brand ?? "正在识别路由器..."}
-                </span>
+            <div className="min-w-0">
+              <div className="text-sm font-bold tracking-tight truncate">Wi-Fi 小管家</div>
+              <div className="text-[11px] text-slate-500 dark:text-zinc-400 truncate">
+                {overview?.router.brand ?? "正在识别网络..."}
               </div>
-              <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
-                {overview
-                  ? `${overview.ssid || (overview.ssid_redacted ? "当前 Wi-Fi（系统隐藏名称）" : "已连接网络")} · ${signalText(overview.signal_dbm)} · 网关 ${overview.router.gateway_ip}`
-                  : "正在读取本机网络信息..."}
-              </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleRescan}
-              disabled={scanning}
-              className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 transition cursor-pointer"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${scanning ? "animate-spin" : ""}`} />
-              {scanning ? "正在扫描设备..." : "刷新设备列表"}
-            </button>
+          {/* Nav */}
+          <nav className="space-y-1">
+            {(
+              [
+                {
+                  id: "devices",
+                  label: "谁在用我的网",
+                  icon: Radar,
+                  badge:
+                    (scan?.new_count ?? 0) > 0 ? `${scan?.new_count}` : null,
+                },
+                { id: "share", label: "扫码连与改密码", icon: KeyRound, badge: null },
+                { id: "health", label: "一键网络体检", icon: Activity, badge: null },
+                { id: "router", label: "路由器与说明", icon: Settings2, badge: null },
+              ] as const
+            ).map((item) => {
+              const Icon = item.icon;
+              const active = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => setActiveTab(item.id)}
+                  className={`w-full px-3 py-2.5 rounded-xl text-[13px] font-medium flex items-center justify-between transition-all cursor-pointer ${
+                    active
+                      ? "bg-blue-600 text-white shadow-sm shadow-blue-600/20"
+                      : "text-slate-600 dark:text-zinc-300 hover:bg-slate-100/90 dark:hover:bg-zinc-800/70"
+                  }`}
+                >
+                  <span className="flex items-center gap-2.5">
+                    <Icon className="w-4 h-4 shrink-0" />
+                    <span>{item.label}</span>
+                  </span>
+                  {item.badge && (
+                    <span
+                      className={`text-[11px] font-semibold px-1.5 py-0.5 rounded-full leading-none ${
+                        active
+                          ? "bg-white/20 text-white"
+                          : "bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300"
+                      }`}
+                    >
+                      {item.badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+
+        {/* Bottom Live Wi-Fi Card */}
+        <div className="rounded-2xl bg-slate-50 dark:bg-zinc-950/70 border border-slate-200/80 dark:border-zinc-800 p-3.5 space-y-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-medium text-slate-500 dark:text-zinc-400">
+              当前无线状态
+            </span>
+            <SignalBars bars={sigMeta.bars} />
+          </div>
+          <div>
+            <div className="text-xs font-semibold truncate">
+              {overview?.ssid ||
+                (overview?.ssid_redacted
+                  ? overview.preferred_ssids[0] || "已连接 Wi-Fi"
+                  : "未识别 SSID")}
+            </div>
+            <div className="text-[11px] text-slate-500 dark:text-zinc-400 mt-0.5 flex items-center justify-between">
+              <span>{sigMeta.label}</span>
+              {overview?.tx_rate_mbps && (
+                <span className="font-mono">{overview.tx_rate_mbps} Mbps</span>
+              )}
+            </div>
+          </div>
+          <div className="pt-2 border-t border-slate-200/70 dark:border-zinc-800 flex items-center justify-between text-[11px] text-slate-500 dark:text-zinc-400">
+            <span>网关</span>
+            <span className="font-mono text-slate-700 dark:text-zinc-300">
+              {overview?.router.gateway_ip ?? "--"}
+            </span>
+          </div>
+        </div>
+      </aside>
+
+      {/* 右侧主内容区 */}
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        {/* 顶部标题栏 */}
+        <header className="h-16 shrink-0 px-6 border-b border-slate-200/80 dark:border-zinc-800/80 bg-white/70 dark:bg-zinc-900/50 backdrop-blur-md flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-base font-bold tracking-tight truncate">
+              {tabMeta[activeTab].title}
+            </h1>
+            <p className="text-xs text-slate-500 dark:text-zinc-400 truncate mt-0.5">
+              {tabMeta[activeTab].subtitle}
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            {activeTab === "devices" && (
+              <button
+                onClick={handleRescan}
+                disabled={scanning}
+                className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 shadow-xs shadow-blue-600/20 transition cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${scanning ? "animate-spin" : ""}`} />
+                {scanning ? "扫描中..." : "刷新设备"}
+              </button>
+            )}
+            {activeTab === "health" && (
+              <button
+                onClick={handleRunHealth}
+                disabled={checkingHealth}
+                className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 shadow-xs shadow-blue-600/20 transition cursor-pointer"
+              >
+                <Activity className={`w-3.5 h-3.5 ${checkingHealth ? "animate-pulse" : ""}`} />
+                {checkingHealth ? "正在体检..." : "开始体检"}
+              </button>
+            )}
           </div>
         </header>
 
-        {toast && (
-          <div className="bg-slate-900 text-white dark:bg-zinc-800 text-xs px-4 py-2.5 rounded-xl flex items-center justify-between shadow-sm">
-            <span>{toast}</span>
-            <button onClick={() => setToast(null)} className="text-slate-300 hover:text-white cursor-pointer">
-              知道了
-            </button>
-          </div>
-        )}
-
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-          {/* 左侧导航 */}
-          <aside className="lg:col-span-3 space-y-3">
-            <nav className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-2 space-y-1">
-              <button
-                onClick={() => setActiveTab("devices")}
-                className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-between transition cursor-pointer ${
-                  activeTab === "devices"
-                    ? "bg-blue-600 text-white"
-                    : "hover:bg-slate-100 dark:hover:bg-zinc-800"
-                }`}
-              >
-                <span className="flex items-center gap-2">
-                  <Radar className="w-4 h-4" />
-                  谁在用我的网
-                </span>
-                {(scan?.new_count ?? 0) > 0 && (
-                  <span
-                    className={`text-xs px-1.5 py-0.5 rounded-full ${
-                      activeTab === "devices"
-                        ? "bg-white/20 text-white"
-                        : "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300"
-                    }`}
-                  >
-                    {scan?.new_count} 新
-                  </span>
-                )}
-              </button>
-
-              <button
-                onClick={() => setActiveTab("share")}
-                className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium flex items-center gap-2 transition cursor-pointer ${
-                  activeTab === "share"
-                    ? "bg-blue-600 text-white"
-                    : "hover:bg-slate-100 dark:hover:bg-zinc-800"
-                }`}
-              >
-                <KeyRound className="w-4 h-4" />
-                扫码连网与改密码
-              </button>
-
-              <button
-                onClick={() => setActiveTab("health")}
-                className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-between transition cursor-pointer ${
-                  activeTab === "health"
-                    ? "bg-blue-600 text-white"
-                    : "hover:bg-slate-100 dark:hover:bg-zinc-800"
-                }`}
-              >
-                <span className="flex items-center gap-2">
-                  <Activity className="w-4 h-4" />
-                  一键网络体检
-                </span>
-                {health && (
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      health.overall_status === "good"
-                        ? "bg-emerald-400"
-                        : health.overall_status === "warning"
-                          ? "bg-amber-400"
-                          : "bg-rose-400"
-                    }`}
-                  />
-                )}
-              </button>
-
-              <button
-                onClick={() => setActiveTab("router")}
-                className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-medium flex items-center gap-2 transition cursor-pointer ${
-                  activeTab === "router"
-                    ? "bg-blue-600 text-white"
-                    : "hover:bg-slate-100 dark:hover:bg-zinc-800"
-                }`}
-              >
-                <Settings className="w-4 h-4" />
-                路由器与说明
-              </button>
-            </nav>
-
-            <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-4 space-y-2">
-              <div className="text-xs font-semibold">小白使用小贴士</div>
-              <ul className="text-xs text-slate-500 dark:text-zinc-400 space-y-1.5 leading-relaxed">
-                <li>• 手机连 Wi-Fi 常会开启“随机 MAC”，不同时段可能显示成新设备。</li>
-                <li>• 建议把家人的手机和电脑点击“改备注”，剩下的陌生设备就一目了然。</li>
-                <li>• 所有备注仅保存在你自己的电脑里。</li>
-              </ul>
-            </div>
-          </aside>
-
-          {/* 右侧主区域 */}
-          <main className="lg:col-span-9 space-y-4">
-            {/* TAB 1: 设备雷达 */}
-            {activeTab === "devices" && (
-              <section className="space-y-4">
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-4">
-                    <div className="text-xs text-slate-500 dark:text-zinc-400">当前在线终端</div>
-                    <div className="text-2xl font-bold mt-1 tabular-nums">
-                      {scan ? `${scan.total_clients} 台` : "--"}
-                    </div>
-                    <div className="text-xs text-slate-500 dark:text-zinc-400 mt-1">
-                      手机/电脑 {personalCount} 台 · 智能/固定设备 {iotCount} 台
-                    </div>
+        {/* 内容滚动区 */}
+        <main className="flex-1 overflow-y-auto p-6 space-y-5 select-text">
+          {/* TAB 1: 设备雷达 */}
+          {activeTab === "devices" && (
+            <>
+              {/* 3 张统计 Bento 卡片 */}
+              <div className="grid grid-cols-3 gap-4">
+                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-4 shadow-2xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-slate-500 dark:text-zinc-400">当前在线终端</span>
+                    <span className="w-7 h-7 rounded-lg bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400 flex items-center justify-center">
+                      <Radar className="w-4 h-4" />
+                    </span>
                   </div>
-
-                  <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-4">
-                    <div className="text-xs text-slate-500 dark:text-zinc-400">待确认的新设备</div>
-                    <div className="text-2xl font-bold mt-1 tabular-nums text-amber-600 dark:text-amber-400">
-                      {scan ? `${scan.new_count} 台` : "--"}
-                    </div>
-                    <div className="text-xs text-slate-500 dark:text-zinc-400 mt-1">
-                      未备注过的陌生设备，点击可标为熟人
-                    </div>
+                  <div className="text-2xl font-bold mt-2 tabular-nums tracking-tight">
+                    {scan ? `${scan.total_clients}` : "--"}
+                    <span className="text-xs font-normal text-slate-400 ml-1">台</span>
                   </div>
-
-                  <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-4">
-                    <div className="text-xs text-slate-500 dark:text-zinc-400">当前无线信号</div>
-                    <div className="text-lg font-bold mt-1">
-                      {signalText(overview?.signal_dbm ?? null)}
-                    </div>
-                    <div className="text-xs text-slate-500 dark:text-zinc-400 mt-1">
-                      {overview?.channel ?? "标准无线网络"}
-                      {overview?.tx_rate_mbps ? ` · ${overview.tx_rate_mbps} Mbps` : ""}
-                    </div>
+                  <div className="text-[11px] text-slate-500 dark:text-zinc-400 mt-1.5">
+                    手机/电脑 {personalCount} · 固定/家居 {iotCount}
                   </div>
                 </div>
 
-                <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-4 space-y-3">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      {(
-                        [
-                          ["all", "全部"],
-                          ["new", "陌生新设备"],
-                          ["personal", "手机 / 电脑"],
-                          ["iot", "固定 / 家居"],
-                          ["blocked", "已屏蔽显示"],
-                        ] as [DeviceFilter, string][]
-                      ).map(([id, label]) => (
-                        <button
-                          key={id}
-                          onClick={() => setFilter(id)}
-                          className={`text-xs px-3 py-1.5 rounded-lg border transition cursor-pointer ${
-                            filter === id
-                              ? "bg-blue-600 text-white border-blue-600 font-medium"
-                              : "border-slate-200 dark:border-zinc-700 text-slate-600 dark:text-zinc-300 hover:bg-slate-100 dark:hover:bg-zinc-800"
-                          }`}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                    </div>
+                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-4 shadow-2xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-slate-500 dark:text-zinc-400">待确认新设备</span>
+                    <span className="w-7 h-7 rounded-lg bg-amber-50 text-amber-600 dark:bg-amber-500/15 dark:text-amber-400 flex items-center justify-center">
+                      <AlertTriangle className="w-4 h-4" />
+                    </span>
+                  </div>
+                  <div className="text-2xl font-bold mt-2 tabular-nums tracking-tight text-amber-600 dark:text-amber-400">
+                    {scan ? `${scan.new_count}` : "--"}
+                    <span className="text-xs font-normal text-slate-400 ml-1">台</span>
+                  </div>
+                  <div className="text-[11px] text-slate-500 dark:text-zinc-400 mt-1.5">
+                    未备注过的陌生设备
+                  </div>
+                </div>
 
-                    <div className="flex items-center gap-3">
-                      <div className="relative">
-                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-                        <input
-                          value={search}
-                          onChange={(e) => setSearch(e.target.value)}
-                          placeholder="搜索名称/品牌/IP..."
-                          className="text-xs pl-8 pr-3 py-1.5 rounded-lg border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950 focus:outline-none focus:border-blue-500 w-44"
-                        />
-                      </div>
+                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-4 shadow-2xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-slate-500 dark:text-zinc-400">无线规格与信道</span>
+                    <span className="w-7 h-7 rounded-lg bg-emerald-50 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400 flex items-center justify-center">
+                      <Wifi className="w-4 h-4" />
+                    </span>
+                  </div>
+                  <div className="text-lg font-bold mt-2 truncate">
+                    {overview?.phy_mode ?? "Wi-Fi"}
+                  </div>
+                  <div className="text-[11px] text-slate-500 dark:text-zinc-400 mt-1.5 truncate">
+                    {overview?.channel ?? sigMeta.label}
+                  </div>
+                </div>
+              </div>
 
-                      <label className="text-xs text-slate-500 dark:text-zinc-400 flex items-center gap-1.5 cursor-pointer select-none">
-                        <input
-                          type="checkbox"
-                          checked={showTech}
-                          onChange={(e) => setShowTech(e.target.checked)}
-                          className="accent-blue-600"
-                        />
-                        显示 IP / MAC
-                      </label>
-                    </div>
+              {/* 列表卡片 */}
+              <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl shadow-2xs overflow-hidden">
+                <div className="px-4 py-3 border-b border-slate-100 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-3">
+                  {/* 分段筛选 */}
+                  <div className="inline-flex items-center p-1 rounded-xl bg-slate-100 dark:bg-zinc-950 gap-0.5">
+                    {(
+                      [
+                        ["all", "全部"],
+                        ["new", "陌生设备"],
+                        ["personal", "手机/电脑"],
+                        ["iot", "固定/家居"],
+                        ["blocked", "已隐藏"],
+                      ] as [DeviceFilter, string][]
+                    ).map(([id, label]) => (
+                      <button
+                        key={id}
+                        onClick={() => setFilter(id)}
+                        className={`text-xs px-2.5 py-1.5 rounded-lg font-medium transition cursor-pointer ${
+                          filter === id
+                            ? "bg-white dark:bg-zinc-800 text-slate-900 dark:text-white shadow-2xs"
+                            : "text-slate-500 dark:text-zinc-400 hover:text-slate-800 dark:hover:text-zinc-200"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
                   </div>
 
-                  <div className="divide-y divide-slate-100 dark:divide-zinc-800">
-                    {scanning && !scan ? (
-                      <div className="py-10 text-center text-xs text-slate-500">
-                        正在扫描局域网中的所有在线设备，通常需要 3～6 秒...
-                      </div>
-                    ) : filteredDevices.length === 0 ? (
-                      <div className="py-10 text-center text-xs text-slate-500">
-                        当前筛选条件下没有设备
-                      </div>
-                    ) : (
-                      filteredDevices.map((d) => (
-                        <div
-                          key={`${d.ip}-${d.mac}`}
-                          className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-                        >
-                          <div className="flex items-start gap-3">
-                            <div
-                              className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
-                                d.is_self
-                                  ? "bg-blue-50 text-blue-600 dark:bg-blue-950 dark:text-blue-300"
+                  {/* 搜索与技术开关 */}
+                  <div className="flex items-center gap-3">
+                    <div className="relative">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        value={search}
+                        onChange={(e) => setSearch(e.target.value)}
+                        placeholder="搜索设备、品牌或 IP"
+                        className="text-xs pl-8 pr-3 py-1.5 rounded-lg border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950 focus:outline-none focus:border-blue-500 w-44"
+                      />
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowTech((v) => !v)}
+                      className="flex items-center gap-2 text-xs text-slate-500 dark:text-zinc-400 cursor-pointer"
+                    >
+                      <span>IP / MAC</span>
+                      <span
+                        className={`w-8 h-4.5 rounded-full p-0.5 transition-colors flex items-center ${
+                          showTech ? "bg-blue-600 justify-end" : "bg-slate-200 dark:bg-zinc-700 justify-start"
+                        }`}
+                      >
+                        <span className="w-3.5 h-3.5 rounded-full bg-white shadow-xs" />
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* 设备行 */}
+                <div className="divide-y divide-slate-100 dark:divide-zinc-800/80">
+                  {scanning && !scan ? (
+                    <div className="py-14 flex flex-col items-center justify-center gap-2 text-xs text-slate-500">
+                      <RefreshCw className="w-5 h-5 animate-spin text-blue-500" />
+                      <span>正在探测局域网设备，请稍候...</span>
+                    </div>
+                  ) : filteredDevices.length === 0 ? (
+                    <div className="py-14 text-center text-xs text-slate-500">
+                      当前筛选条件下没有设备
+                    </div>
+                  ) : (
+                    filteredDevices.map((d) => (
+                      <div
+                        key={`${d.ip}-${d.mac}`}
+                        className="px-4 py-3 flex items-center justify-between gap-4 hover:bg-slate-50/70 dark:hover:bg-zinc-800/30 transition-colors"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div
+                            className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
+                              d.is_self
+                                ? "bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400"
+                                : d.is_gateway
+                                  ? "bg-indigo-50 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-400"
                                   : d.is_new
-                                    ? "bg-amber-50 text-amber-600 dark:bg-amber-950 dark:text-amber-300"
+                                    ? "bg-amber-50 text-amber-600 dark:bg-amber-500/15 dark:text-amber-400"
                                     : "bg-slate-100 text-slate-600 dark:bg-zinc-800 dark:text-zinc-300"
-                              }`}
-                            >
-                              <DeviceIcon type={d.device_type} />
-                            </div>
-
-                            <div>
-                              <div className="flex items-center gap-2 flex-wrap">
-                                <span className="text-sm font-medium">{d.display_name}</span>
-                                {d.is_self && (
-                                  <span className="text-xs px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300">
-                                    本机
-                                  </span>
-                                )}
-                                {d.is_gateway && (
-                                  <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 dark:bg-zinc-800 dark:text-zinc-300">
-                                    路由器
-                                  </span>
-                                )}
-                                {d.is_new && !d.blocked && (
-                                  <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300">
-                                    陌生新设备
-                                  </span>
-                                )}
-                                {d.trusted && !d.is_self && !d.is_gateway && !d.blocked && (
-                                  <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">
-                                    熟人
-                                  </span>
-                                )}
-                              </div>
-
-                              <div className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
-                                {d.vendor}
-                                {d.latency_ms ? ` · 响应 ${d.latency_ms} ms` : d.ping_alive ? " · 在线" : " · 静默在线（禁 Ping）"}
-                              </div>
-
-                              {showTech && (
-                                <div className="text-xs font-mono text-slate-400 dark:text-zinc-500 mt-1">
-                                  IP: {d.ip} · MAC: {d.mac}
-                                  {d.hostname ? ` · ${d.hostname}` : ""}
-                                </div>
-                              )}
-                            </div>
+                            }`}
+                          >
+                            <DeviceIcon type={d.device_type} />
                           </div>
 
-                          <div className="flex items-center gap-2 flex-wrap shrink-0">
-                            {!d.blocked ? (
-                              <>
-                                {d.is_new && (
-                                  <button
-                                    onClick={() => handleTrustDevice(d)}
-                                    className="text-xs px-2.5 py-1.5 rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950 dark:text-emerald-300 cursor-pointer"
-                                  >
-                                    标为熟人
-                                  </button>
-                                )}
-                                {!d.is_gateway && (
-                                  <button
-                                    onClick={() => {
-                                      setRenamingDevice(d);
-                                      setRenameInput(d.alias ?? d.display_name);
-                                    }}
-                                    className="inline-flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 cursor-pointer"
-                                  >
-                                    <Pencil className="w-3 h-3" />
-                                    改备注
-                                  </button>
-                                )}
-                                {!d.is_self && !d.is_gateway && (
-                                  <button
-                                    onClick={() => handleToggleHidden(d, true)}
-                                    className="text-xs px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-zinc-700 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 cursor-pointer"
-                                  >
-                                    隐藏设备
-                                  </button>
-                                )}
-                              </>
-                            ) : (
-                              <button
-                                onClick={() => handleToggleHidden(d, false)}
-                                className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-zinc-800 cursor-pointer"
-                              >
-                                恢复显示
-                              </button>
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="text-[13px] font-semibold truncate">
+                                {d.display_name}
+                              </span>
+                              {d.is_self && (
+                                <span className="text-[11px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300 font-medium">
+                                  本机
+                                </span>
+                              )}
+                              {d.is_gateway && (
+                                <span className="text-[11px] px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300 font-medium">
+                                  主路由器
+                                </span>
+                              )}
+                              {d.is_new && !d.blocked && (
+                                <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 dark:bg-amber-500/20 dark:text-amber-300 font-medium">
+                                  新设备
+                                </span>
+                              )}
+                              {d.trusted && !d.is_self && !d.is_gateway && !d.blocked && (
+                                <span className="text-[11px] px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 font-medium">
+                                  熟人
+                                </span>
+                              )}
+                            </div>
+
+                            <div className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5 flex items-center gap-1.5 flex-wrap">
+                              <span
+                                className={`w-1.5 h-1.5 rounded-full ${
+                                  d.ping_alive ? "bg-emerald-500" : "bg-slate-300 dark:bg-zinc-600"
+                                }`}
+                              />
+                              <span>{d.vendor}</span>
+                              <span>·</span>
+                              <span>
+                                {d.latency_ms
+                                  ? `${d.latency_ms} ms`
+                                  : d.ping_alive
+                                    ? "在线"
+                                    : "静默在线"}
+                              </span>
+                            </div>
+
+                            {showTech && (
+                              <div className="text-[11px] font-mono text-slate-400 dark:text-zinc-500 mt-1">
+                                {d.ip} · {d.mac}
+                                {d.hostname ? ` · ${d.hostname}` : ""}
+                              </div>
                             )}
                           </div>
                         </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-              </section>
-            )}
 
-            {/* TAB 2: 扫码连网与改密码 */}
-            {activeTab === "share" && (
-              <section className="grid grid-cols-1 md:grid-cols-12 gap-4">
-                <div className="md:col-span-7 bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-5 space-y-4">
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {!d.blocked ? (
+                            <>
+                              {d.is_new && (
+                                <button
+                                  onClick={() => handleTrustDevice(d)}
+                                  className="text-xs font-medium px-2.5 py-1.5 rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-500/15 dark:text-emerald-300 transition cursor-pointer"
+                                >
+                                  标为熟人
+                                </button>
+                              )}
+                              {!d.is_gateway && (
+                                <button
+                                  onClick={() => {
+                                    setRenamingDevice(d);
+                                    setRenameInput(d.alias ?? d.display_name);
+                                  }}
+                                  className="inline-flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 transition cursor-pointer"
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                  备注
+                                </button>
+                              )}
+                              {!d.is_self && !d.is_gateway && (
+                                <button
+                                  onClick={() => handleToggleHidden(d, true)}
+                                  className="text-xs px-2.5 py-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-500/10 transition cursor-pointer"
+                                >
+                                  隐藏
+                                </button>
+                              )}
+                            </>
+                          ) : (
+                            <button
+                              onClick={() => handleToggleHidden(d, false)}
+                              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 transition cursor-pointer"
+                            >
+                              恢复显示
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* TAB 2: 扫码连网与改密码 */}
+          {activeTab === "share" && (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+              <div className="lg:col-span-7 space-y-5">
+                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-4 shadow-2xs">
                   <div>
-                    <h2 className="text-sm font-bold">查看并分享当前 Wi-Fi 密码</h2>
+                    <h2 className="text-sm font-bold">读取当前 Wi-Fi 密码</h2>
                     <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
-                      无需登录路由器，直接从本机系统安全存储读取已连 Wi-Fi 的密码并生成二维码。
+                      不需要路由器账号，直接从系统安全钥匙串获取密码。
                     </p>
                   </div>
 
                   {overview?.ssid_redacted && (
-                    <div className="text-xs p-3 rounded-xl bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 border border-amber-200 dark:border-amber-900">
-                      macOS 未授予“定位权限”时会隐藏当前 Wi-Fi 名称，已为你列出本机最近连过的网络，选择对应名称即可读取密码：
+                    <div className="text-xs p-3 rounded-xl bg-amber-50 text-amber-800 dark:bg-amber-500/10 dark:text-amber-300 border border-amber-200/70 dark:border-amber-500/20">
+                      macOS 未开启定位权限时会隐藏当前 Wi-Fi 名，已在右侧下拉框列出你最近连过的网络供直接选择。
                     </div>
                   )}
 
                   <div className="space-y-3">
                     <div>
-                      <label className="block text-xs text-slate-500 dark:text-zinc-400 mb-1">
+                      <label className="block text-xs font-medium text-slate-500 dark:text-zinc-400 mb-1.5">
                         Wi-Fi 名称
                       </label>
                       <div className="flex gap-2">
@@ -668,7 +759,7 @@ export function App() {
                     </div>
 
                     <div>
-                      <label className="block text-xs text-slate-500 dark:text-zinc-400 mb-1">
+                      <label className="block text-xs font-medium text-slate-500 dark:text-zinc-400 mb-1.5">
                         Wi-Fi 密码
                       </label>
                       <div className="flex gap-2">
@@ -676,14 +767,13 @@ export function App() {
                           type={showPassword ? "text" : "password"}
                           value={wifiPassword}
                           onChange={(e) => setWifiPassword(e.target.value)}
-                          placeholder="点击右侧按钮从系统读取，或手动输入"
+                          placeholder="点击下方「读取本机密码」或手动输入"
                           className="flex-1 text-sm px-3 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950 focus:outline-none focus:border-blue-500"
                         />
                         <button
                           type="button"
                           onClick={() => setShowPassword((v) => !v)}
-                          className="px-3 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 cursor-pointer"
-                          title={showPassword ? "隐藏" : "显示"}
+                          className="px-3 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 transition cursor-pointer"
                         >
                           {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                         </button>
@@ -694,198 +784,255 @@ export function App() {
                       <button
                         onClick={handleReadSavedPassword}
                         disabled={readingPw}
-                        className="text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 cursor-pointer"
+                        className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 transition cursor-pointer"
                       >
-                        {readingPw ? "正在读取..." : "🔐 读取本机已保存的密码"}
+                        <Lock className="w-3.5 h-3.5" />
+                        {readingPw ? "正在读取..." : "读取本机保存的密码"}
                       </button>
                       <button
                         onClick={handleCopyWifiCard}
-                        className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 cursor-pointer"
+                        className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 transition cursor-pointer"
                       >
-                        <Copy className="w-3.5 h-3.5" />
-                        复制发微信
+                        {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+                        {copied ? "已复制" : "复制发微信"}
                       </button>
                     </div>
                   </div>
+                </div>
 
-                  {/* 修改路由器密码引导卡片 */}
-                  <div className="border-t border-slate-100 dark:border-zinc-800 pt-4 space-y-2.5">
-                    <div className="flex items-center justify-between">
-                      <h3 className="text-sm font-bold">想修改家里 Wi-Fi 密码？</h3>
-                      <span className="text-xs text-slate-500">
-                        已识别：{overview?.router.brand ?? "路由器"}
-                      </span>
-                    </div>
-                    <p className="text-xs text-slate-500 dark:text-zinc-400">
-                      V0.1 通用版支持一键打开你家路由器后台，按下面 3 步修改即可（V0.2 将支持中兴/TP-Link/小米一键直改）：
-                    </p>
-                    <ol className="text-xs text-slate-600 dark:text-zinc-300 space-y-1 list-decimal list-inside">
-                      {(overview?.router.guide_steps ?? []).map((step, i) => (
-                        <li key={i}>{step}</li>
-                      ))}
-                    </ol>
+                {/* 改密码引导卡 */}
+                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-3 shadow-2xs">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-bold">修改路由器 Wi-Fi 密码</h3>
+                    <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-zinc-300">
+                      {overview?.router.brand ?? "路由器"}
+                    </span>
+                  </div>
+                  <div className="space-y-2 pt-1">
+                    {(overview?.router.guide_steps ?? []).map((step, i) => (
+                      <div key={i} className="flex items-start gap-2.5 text-xs text-slate-600 dark:text-zinc-300">
+                        <span className="w-5 h-5 rounded-full bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400 font-semibold flex items-center justify-center shrink-0 text-[11px]">
+                          {i + 1}
+                        </span>
+                        <span className="pt-0.5 leading-relaxed">{step}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="pt-1">
                     <button
                       onClick={handleOpenRouterAdmin}
-                      className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 cursor-pointer"
+                      className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 transition cursor-pointer"
                     >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                      打开路由器管理页 ({overview?.router.admin_url})
+                      <span>打开路由器后台 ({overview?.router.admin_url})</span>
+                      <ArrowUpRight className="w-3.5 h-3.5" />
                     </button>
                   </div>
                 </div>
+              </div>
 
-                {/* 右侧扫码卡片 */}
-                <div className="md:col-span-5 bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-5 flex flex-col items-center justify-center text-center space-y-3">
-                  <div className="text-sm font-bold">亲友手机扫一扫直接连</div>
-                  <div className="p-2 rounded-2xl bg-white border border-slate-200">
+              {/* 右侧：精致的分享二维码通行卡 */}
+              <div className="lg:col-span-5">
+                <div className="bg-gradient-to-b from-white to-slate-50 dark:from-zinc-900 dark:to-zinc-950 border border-slate-200/80 dark:border-zinc-800 rounded-3xl p-6 flex flex-col items-center text-center space-y-4 shadow-sm">
+                  <div className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 px-3 py-1 rounded-full">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>亲友扫码连网通行卡</span>
+                  </div>
+
+                  <div className="p-3 rounded-2xl bg-white border border-slate-200/80 shadow-xs">
                     {selectedSsid.trim() ? (
                       <canvas ref={qrCanvasRef} className="block" />
                     ) : (
                       <div className="w-44 h-44 flex items-center justify-center text-xs text-slate-400">
-                        选择 Wi-Fi 名称后生成二维码
+                        选择 Wi-Fi 名称后生成
                       </div>
                     )}
                   </div>
-                  <div className="text-xs text-slate-500 dark:text-zinc-400">
-                    网络：<span className="font-semibold text-slate-800 dark:text-zinc-200">{selectedSsid || "未选择"}</span>
+
+                  <div className="space-y-1">
+                    <div className="text-sm font-bold">{selectedSsid || "未选择网络"}</div>
+                    <div className="text-xs text-slate-500 dark:text-zinc-400">
+                      {wifiPassword ? "已包含密码 · 扫一扫直接连接" : "暂未填入密码 · 仅名称"}
+                    </div>
                   </div>
-                  <p className="text-xs text-slate-400 dark:text-zinc-500 leading-relaxed">
-                    支持 iPhone 原生相机、安卓系统相机与微信扫一扫识别连接。
+
+                  <p className="text-[11px] text-slate-400 dark:text-zinc-500 leading-relaxed max-w-xs">
+                    打开 iPhone 相机、安卓相机或微信扫一扫，对准上方二维码即可一键连入 Wi-Fi。
                   </p>
                 </div>
-              </section>
-            )}
+              </div>
+            </div>
+          )}
 
-            {/* TAB 3: 一键网络体检 */}
-            {activeTab === "health" && (
-              <section className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-5 space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <h2 className="text-sm font-bold">网速慢、老断线？一键查出哪里卡了</h2>
-                    <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
-                      真实测试你本机到路由器、再到外网宽带的延迟与连通性，用大白话给出排查建议。
+          {/* TAB 3: 一键网络体检 */}
+          {activeTab === "health" && (
+            <div className="space-y-5">
+              {!health ? (
+                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-12 flex flex-col items-center text-center space-y-4 shadow-2xs">
+                  <div className="w-14 h-14 rounded-2xl bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400 flex items-center justify-center">
+                    <Activity className="w-7 h-7" />
+                  </div>
+                  <div className="space-y-1 max-w-md">
+                    <h2 className="text-base font-bold">网络卡顿？2 秒查明原因</h2>
+                    <p className="text-xs text-slate-500 dark:text-zinc-400 leading-relaxed">
+                      会分别检测「本机到路由器信号延迟」和「路由器到外部宽带连通性」，直接告诉你该怎么解决。
                     </p>
                   </div>
                   <button
                     onClick={handleRunHealth}
                     disabled={checkingHealth}
-                    className="text-xs font-medium px-4 py-2.5 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 cursor-pointer shrink-0"
+                    className="inline-flex items-center gap-2 text-xs font-semibold px-5 py-2.5 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 shadow-sm shadow-blue-600/20 transition cursor-pointer"
                   >
-                    {checkingHealth ? "正在体检中..." : "🩺 开始一键体检"}
+                    <Activity className={`w-4 h-4 ${checkingHealth ? "animate-pulse" : ""}`} />
+                    {checkingHealth ? "正在检测中..." : "立即开始体检"}
                   </button>
                 </div>
-
-                {!health ? (
-                  <div className="py-10 text-center text-xs text-slate-500 border border-dashed border-slate-200 dark:border-zinc-800 rounded-xl">
-                    点击右上角「开始一键体检」，大约 2 秒即可得出诊断结果。
-                  </div>
-                ) : (
-                  <div className="space-y-4">
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                      {health.steps.map((s) => (
-                        <div
-                          key={s.id}
-                          className="p-4 rounded-xl bg-slate-50 dark:bg-zinc-950 border border-slate-200 dark:border-zinc-800 space-y-1.5"
-                        >
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="font-semibold">{s.title}</span>
-                            <span
-                              className={`font-medium ${
-                                s.status === "good"
-                                  ? "text-emerald-600 dark:text-emerald-400"
-                                  : s.status === "warning"
-                                    ? "text-amber-600 dark:text-amber-400"
-                                    : "text-rose-600 dark:text-rose-400"
-                              }`}
-                            >
-                              {s.badge}
-                            </span>
-                          </div>
-                          <p className="text-xs text-slate-500 dark:text-zinc-400 leading-relaxed">
-                            {s.detail}
-                          </p>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="p-4 rounded-xl border border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-950 flex items-start gap-3">
+              ) : (
+                <>
+                  {/* 结论横幅 */}
+                  <div
+                    className={`rounded-2xl p-5 border flex items-start gap-4 shadow-2xs ${
+                      health.overall_status === "good"
+                        ? "bg-emerald-50/70 border-emerald-200 dark:bg-emerald-500/10 dark:border-emerald-500/25"
+                        : health.overall_status === "warning"
+                          ? "bg-amber-50/70 border-amber-200 dark:bg-amber-500/10 dark:border-amber-500/25"
+                          : "bg-rose-50/70 border-rose-200 dark:bg-rose-500/10 dark:border-rose-500/25"
+                    }`}
+                  >
+                    <div className="mt-0.5 shrink-0">
                       {health.overall_status === "good" ? (
-                        <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0 mt-0.5" />
+                        <CheckCircle2 className="w-6 h-6 text-emerald-600 dark:text-emerald-400" />
                       ) : (
-                        <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                        <AlertTriangle
+                          className={`w-6 h-6 ${
+                            health.overall_status === "warning"
+                              ? "text-amber-600 dark:text-amber-400"
+                              : "text-rose-600 dark:text-rose-400"
+                          }`}
+                        />
                       )}
-                      <div className="text-xs space-y-1">
-                        <div className="font-bold text-sm">{health.summary_title}</div>
-                        <p className="text-slate-600 dark:text-zinc-300 leading-relaxed">
-                          {health.summary_advice}
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-sm font-bold">{health.summary_title}</div>
+                      <p className="text-xs text-slate-600 dark:text-zinc-300 leading-relaxed">
+                        {health.summary_advice}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* 三步卡片 */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    {health.steps.map((s) => (
+                      <div
+                        key={s.id}
+                        className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-4 space-y-2 shadow-2xs"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold">{s.title}</span>
+                          <span
+                            className={`text-[11px] font-medium px-2 py-0.5 rounded-full ${
+                              s.status === "good"
+                                ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300"
+                                : s.status === "warning"
+                                  ? "bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+                                  : "bg-rose-50 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300"
+                            }`}
+                          >
+                            {s.badge}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-500 dark:text-zinc-400 leading-relaxed">
+                          {s.detail}
                         </p>
                       </div>
-                    </div>
+                    ))}
                   </div>
-                )}
-              </section>
-            )}
+                </>
+              )}
+            </div>
+          )}
 
-            {/* TAB 4: 路由器与说明 */}
-            {activeTab === "router" && (
-              <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-5 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <h2 className="text-sm font-bold">已识别的路由器指纹</h2>
-                    <ShieldCheck className="w-4 h-4 text-emerald-500" />
-                  </div>
-                  <div className="text-xs space-y-2 text-slate-600 dark:text-zinc-300">
-                    <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-zinc-800">
-                      <span className="text-slate-500">品牌识别</span>
-                      <span className="font-medium">{overview?.router.brand ?? "--"}</span>
-                    </div>
-                    <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-zinc-800">
-                      <span className="text-slate-500">管理地址</span>
-                      <span className="font-mono">{overview?.router.admin_url ?? "--"}</span>
-                    </div>
-                    <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-zinc-800">
-                      <span className="text-slate-500">路由器 MAC</span>
-                      <span className="font-mono">{overview?.router.gateway_mac ?? "--"}</span>
-                    </div>
-                    <div className="flex justify-between py-1.5">
-                      <span className="text-slate-500">后台页面标题</span>
-                      <span>{overview?.router.page_title ?? "默认管理页"}</span>
-                    </div>
-                  </div>
-                  <button
-                    onClick={handleOpenRouterAdmin}
-                    className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 cursor-pointer"
-                  >
-                    <ExternalLink className="w-3.5 h-3.5" />
-                    在浏览器中打开路由器后台
-                  </button>
+          {/* TAB 4: 路由器与说明 */}
+          {activeTab === "router" && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-4 shadow-2xs">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-sm font-bold">当前路由器识别信息</h2>
+                  <ShieldCheck className="w-4 h-4 text-emerald-500" />
                 </div>
 
-                <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-5 space-y-3">
-                  <h2 className="text-sm font-bold">关于当前版本 (V0.1 MVP)</h2>
-                  <p className="text-xs text-slate-500 dark:text-zinc-400 leading-relaxed">
-                    当前版本已实现完全通用的局域网发现、本地熟人备注持久化、系统 Wi-Fi 密码读取扫码以及三步网络体检，支持 macOS 与 Windows 双端编译。
-                  </p>
-                  <div className="text-xs bg-slate-50 dark:bg-zinc-950 border border-slate-200 dark:border-zinc-800 rounded-xl p-3 space-y-1 text-slate-600 dark:text-zinc-300">
-                    <div className="font-semibold">下一阶段规划（V0.2）：</div>
-                    <div>• 接入中兴（ZTE）/ OpenWrt / 小米 / TP-Link 路由器适配器</div>
-                    <div>• 软件内直接修改 Wi-Fi 密码与一键踢出陌生设备</div>
-                    <div>• 后台定时静默扫描 + 新设备接入系统通知</div>
+                <div className="text-xs divide-y divide-slate-100 dark:divide-zinc-800">
+                  <div className="py-2.5 flex justify-between">
+                    <span className="text-slate-500 dark:text-zinc-400">识别品牌</span>
+                    <span className="font-semibold">{overview?.router.brand ?? "--"}</span>
+                  </div>
+                  <div className="py-2.5 flex justify-between">
+                    <span className="text-slate-500 dark:text-zinc-400">管理后台</span>
+                    <span className="font-mono">{overview?.router.admin_url ?? "--"}</span>
+                  </div>
+                  <div className="py-2.5 flex justify-between">
+                    <span className="text-slate-500 dark:text-zinc-400">网关 MAC</span>
+                    <span className="font-mono">{overview?.router.gateway_mac ?? "--"}</span>
+                  </div>
+                  <div className="py-2.5 flex justify-between">
+                    <span className="text-slate-500 dark:text-zinc-400">页面标题</span>
+                    <span className="truncate max-w-44">
+                      {overview?.router.page_title ?? "默认管理页"}
+                    </span>
                   </div>
                 </div>
-              </section>
-            )}
-          </main>
-        </div>
+
+                <button
+                  onClick={handleOpenRouterAdmin}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 transition cursor-pointer"
+                >
+                  <span>在浏览器打开后台</span>
+                  <ArrowUpRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-3 shadow-2xs">
+                <h2 className="text-sm font-bold">版本路线（V0.1 → V0.2）</h2>
+                <p className="text-xs text-slate-500 dark:text-zinc-400 leading-relaxed">
+                  当前是 V0.1 通用基础版：无需登录路由器即可看清局域网设备、做陌生设备备注、读本机密码扫码分享及网络体检。
+                </p>
+                <div className="rounded-xl bg-slate-50 dark:bg-zinc-950 border border-slate-200/70 dark:border-zinc-800 p-3.5 space-y-2 text-xs text-slate-600 dark:text-zinc-300">
+                  <div className="font-semibold text-slate-800 dark:text-zinc-100">
+                    即将上线（V0.2）：
+                  </div>
+                  <ul className="space-y-1">
+                    <li>• 对接中兴 / 小米 / TP-Link / OpenWrt 一键改密与踢人</li>
+                    <li>• 后台定时静默巡检 + 新设备上线桌面弹窗提醒</li>
+                    <li>• 真实带宽测速（Mbps）与智能家居 SSDP 设备识别</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          )}
+        </main>
       </div>
+
+      {/* 底部浮动 Toast */}
+      {toast && (
+        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 dark:bg-zinc-800 text-white text-xs px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-3">
+          <span>{toast}</span>
+          <button
+            onClick={() => setToast(null)}
+            className="text-slate-400 hover:text-white cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* 重命名弹窗 */}
       {renamingDevice && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
-          <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-5 w-full max-w-sm space-y-3 shadow-xl">
-            <div className="text-sm font-bold">给设备起个好记的名字</div>
-            <div className="text-xs text-slate-500">
-              例如：“我的电脑”、“客厅电视”、“妈妈的手机”
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+          <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-2xl p-5 w-full max-w-sm space-y-3.5 shadow-xl">
+            <div>
+              <div className="text-sm font-bold">给设备起个好记的名字</div>
+              <div className="text-xs text-slate-500 mt-0.5">
+                例如：“我的电脑”、“客厅电视”、“妈妈的手机”
+              </div>
             </div>
             <input
               autoFocus
@@ -894,16 +1041,16 @@ export function App() {
               onKeyDown={(e) => e.key === "Enter" && handleSaveAlias()}
               className="w-full text-sm px-3 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950 focus:outline-none focus:border-blue-500"
             />
-            <div className="flex justify-end gap-2 pt-1">
+            <div className="flex justify-end gap-2">
               <button
                 onClick={() => setRenamingDevice(null)}
-                className="text-xs px-3 py-1.5 rounded-lg border border-slate-200 dark:border-zinc-700 cursor-pointer"
+                className="text-xs px-3 py-1.5 rounded-lg border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 cursor-pointer"
               >
                 取消
               </button>
               <button
                 onClick={handleSaveAlias}
-                className="text-xs px-3 py-1.5 rounded-lg bg-blue-600 text-white cursor-pointer"
+                className="text-xs font-medium px-3.5 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 cursor-pointer"
               >
                 保存备注
               </button>
