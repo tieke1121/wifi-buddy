@@ -5,7 +5,9 @@ import {
   Bell,
   Clock,
   KeyRound,
+  Moon,
   PlugZap,
+  Plus,
   Power,
   RefreshCw,
   Router,
@@ -17,7 +19,9 @@ import {
 import type {
   AppPreferences,
   AppSettings,
+  DeviceView,
   NetworkOverview,
+  ParentalRule,
   RouterBindResult,
   RouterClientInfo,
 } from "../types";
@@ -25,6 +29,7 @@ import type {
 interface RouterGuardianTabProps {
   overview: NetworkOverview | null;
   preferences: AppPreferences | null;
+  devices: DeviceView[];
   onOpenRouterAdmin: () => void;
   onUpdateSettings: (next: AppSettings) => Promise<void>;
   onClearEvents: () => Promise<void>;
@@ -42,6 +47,7 @@ function formatEventTime(ts: number): string {
 export function RouterGuardianTab({
   overview,
   preferences,
+  devices,
   onOpenRouterAdmin,
   onUpdateSettings,
   onClearEvents,
@@ -67,6 +73,19 @@ export function RouterGuardianTab({
   const [loadingClients, setLoadingClients] = useState(false);
   const [rebooting, setRebooting] = useState(false);
   const [confirmReboot, setConfirmReboot] = useState(false);
+
+  // 夜间/孩子断网守护规则
+  const selectableDevices = devices.filter((d) => !d.is_self && !d.is_gateway);
+  const [ruleMac, setRuleMac] = useState("");
+  const [ruleStart, setRuleStart] = useState("23:00");
+  const [ruleEnd, setRuleEnd] = useState("07:00");
+  const [savingRule, setSavingRule] = useState(false);
+
+  useEffect(() => {
+    if (!ruleMac && selectableDevices.length > 0) {
+      setRuleMac(selectableDevices[0].mac);
+    }
+  }, [ruleMac, selectableDevices]);
 
   useEffect(() => {
     if (preferences?.router_binding?.username) {
@@ -142,6 +161,63 @@ export function RouterGuardianTab({
       notify(String(err));
     } finally {
       setRebooting(false);
+    }
+  }
+
+  async function handleToggleAutostart(enabled: boolean) {
+    try {
+      await invoke<boolean>("set_autostart", { enabled });
+      await onRefreshPreferences();
+      notify(enabled ? "已开启开机自动启动" : "已关闭开机自动启动");
+    } catch (err) {
+      notify(`设置开机自启失败：${String(err)}`);
+    }
+  }
+
+  async function handleAddParentalRule() {
+    const dev = selectableDevices.find((d) => d.mac === ruleMac);
+    if (!dev) {
+      notify("请先在下拉框选择需要守护的设备");
+      return;
+    }
+    setSavingRule(true);
+    try {
+      const rule: ParentalRule = {
+        id: `${dev.mac}-${Date.now()}`,
+        mac: dev.mac,
+        device_name: dev.display_name,
+        start_hhmm: ruleStart,
+        end_hhmm: ruleEnd,
+        enabled: true,
+      };
+      await invoke("save_parental_rule", { rule });
+      await onRefreshPreferences();
+      notify(`已为「${dev.display_name}」添加 ${ruleStart} ~ ${ruleEnd} 守护规则`);
+    } catch (err) {
+      notify(`保存规则失败：${String(err)}`);
+    } finally {
+      setSavingRule(false);
+    }
+  }
+
+  async function handleToggleParentalRule(rule: ParentalRule) {
+    try {
+      await invoke("save_parental_rule", {
+        rule: { ...rule, enabled: !rule.enabled },
+      });
+      await onRefreshPreferences();
+    } catch (err) {
+      notify(`更新失败：${String(err)}`);
+    }
+  }
+
+  async function handleDeleteParentalRule(id: string) {
+    try {
+      await invoke("delete_parental_rule", { id });
+      await onRefreshPreferences();
+      notify("已删除守护规则");
+    } catch (err) {
+      notify(`删除失败：${String(err)}`);
     }
   }
 
@@ -382,37 +458,138 @@ export function RouterGuardianTab({
             )}
           </div>
 
-          {/* 版本路线 V0.2 */}
+          {/* 孩子 / 夜间定时断网守护 */}
+          <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-3.5 shadow-2xs">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Moon className="w-4 h-4 text-indigo-500" />
+                <h2 className="text-sm font-bold">孩子 / 夜间定时断网守护</h2>
+              </div>
+              <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-zinc-300">
+                {router?.capabilities?.supports_block_mac && isBound
+                  ? "路由器自动执行"
+                  : "到点弹窗提醒"}
+              </span>
+            </div>
+
+            <p className="text-xs text-slate-500 dark:text-zinc-400">
+              设置休息时段（例如 23:00 ~ 07:00）。已绑定支持黑名单的路由器（小米 / TP-Link / OpenWrt）会自动到点暂停与恢复联网。
+            </p>
+
+            <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
+              <div className="sm:col-span-5">
+                <label className="block text-[11px] text-slate-500 mb-1">选择设备</label>
+                <select
+                  value={ruleMac}
+                  onChange={(e) => setRuleMac(e.target.value)}
+                  className="w-full text-xs px-2.5 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950"
+                >
+                  {selectableDevices.length === 0 ? (
+                    <option value="">暂无可选设备</option>
+                  ) : (
+                    selectableDevices.map((d) => (
+                      <option key={d.mac} value={d.mac}>
+                        {d.display_name}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block text-[11px] text-slate-500 mb-1">开始</label>
+                <input
+                  type="time"
+                  value={ruleStart}
+                  onChange={(e) => setRuleStart(e.target.value)}
+                  className="w-full text-xs px-2 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950"
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block text-[11px] text-slate-500 mb-1">结束</label>
+                <input
+                  type="time"
+                  value={ruleEnd}
+                  onChange={(e) => setRuleEnd(e.target.value)}
+                  className="w-full text-xs px-2 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950"
+                />
+              </div>
+              <div className="sm:col-span-3">
+                <button
+                  type="button"
+                  onClick={handleAddParentalRule}
+                  disabled={savingRule || !ruleMac}
+                  className="w-full inline-flex items-center justify-center gap-1 text-xs font-medium px-3 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  添加规则
+                </button>
+              </div>
+            </div>
+
+            {(preferences?.parental_rules?.length ?? 0) > 0 && (
+              <div className="divide-y divide-slate-100 dark:divide-zinc-800 rounded-xl border border-slate-200/70 dark:border-zinc-800 overflow-hidden">
+                {preferences!.parental_rules.map((rule) => (
+                  <div
+                    key={rule.id}
+                    className="px-3 py-2.5 flex items-center justify-between gap-2 text-xs bg-slate-50/50 dark:bg-zinc-950/50"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-semibold truncate">{rule.device_name}</div>
+                      <div className="text-[11px] text-slate-500 font-mono">
+                        {rule.start_hhmm} ~ {rule.end_hhmm}
+                        {rule.currently_enforced ? " · 正在休息限制中" : ""}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={rule.enabled}
+                        onChange={() => handleToggleParentalRule(rule)}
+                        className="w-4 h-4 accent-blue-600 cursor-pointer"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteParentalRule(rule.id)}
+                        className="text-slate-400 hover:text-rose-500 cursor-pointer p-1"
+                        title="删除规则"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 版本路线 V0.3 */}
           <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-3 shadow-2xs">
             <div className="flex items-center justify-between">
-              <h2 className="text-sm font-bold">当前版本：V0.2 体验增强与专属适配</h2>
+              <h2 className="text-sm font-bold">当前版本：V0.3 多品牌适配与家庭守护</h2>
               <span className="text-[11px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-300 font-medium">
-                v0.2.0
+                v0.3.0
               </span>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-slate-600 dark:text-zinc-300">
               <div className="rounded-xl bg-slate-50 dark:bg-zinc-950 p-3 space-y-1">
                 <div className="font-semibold text-slate-800 dark:text-zinc-100 flex items-center gap-1.5">
                   <Bell className="w-3.5 h-3.5 text-blue-500" />
-                  托盘常驻与新设备提醒
+                  五大家用路由器生态适配
                 </div>
                 <p className="text-[11px] text-slate-500 dark:text-zinc-400">
-                  关闭窗口最小化到托盘，后台定时静默巡检并弹窗提醒陌生设备。
+                  支持 OpenWrt、小米、TP-Link、华为、中兴自动识别，并支持访客 Wi-Fi 一键开关。
                 </p>
               </div>
               <div className="rounded-xl bg-slate-50 dark:bg-zinc-950 p-3 space-y-1">
                 <div className="font-semibold text-slate-800 dark:text-zinc-100 flex items-center gap-1.5">
                   <Wifi className="w-3.5 h-3.5 text-emerald-500" />
-                  SSDP 智能家居 & 真实测速
+                  夜间守护、开机自启与诊断导出
                 </div>
                 <p className="text-[11px] text-slate-500 dark:text-zinc-400">
-                  自动识别电视/音箱/打印机型号，支持一键多节点真实下载测速（Mbps）。
+                  Mac/Win 开机自启常驻托盘，支持定时断网守护与一键复制排障报告。
                 </p>
               </div>
             </div>
-            <p className="text-[11px] text-slate-400 dark:text-zinc-500">
-              V0.3 规划：扩展小米 / TP-Link / 华为适配器、访客 Wi-Fi 定时关闭与夜间断网守护。
-            </p>
           </div>
         </div>
 
@@ -493,6 +670,21 @@ export function RouterGuardianTab({
                   onChange={(e) =>
                     onUpdateSettings({ ...settings, minimize_to_tray: e.target.checked })
                   }
+                  className="w-4 h-4 accent-blue-600 cursor-pointer"
+                />
+              </label>
+
+              <label className="flex items-center justify-between gap-3 cursor-pointer pt-1 border-t border-slate-100 dark:border-zinc-800">
+                <div>
+                  <div className="font-medium">开机自动启动并常驻托盘</div>
+                  <div className="text-[11px] text-slate-400">
+                    登录电脑后自动在后台守护家庭 Wi-Fi 安全
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={Boolean(preferences?.autostart_enabled)}
+                  onChange={(e) => handleToggleAutostart(e.target.checked)}
                   className="w-4 h-4 accent-blue-600 cursor-pointer"
                 />
               </label>

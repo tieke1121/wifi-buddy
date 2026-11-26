@@ -2,6 +2,7 @@ export interface RouterCapabilities {
   supports_clients: boolean;
   supports_wifi_config: boolean;
   supports_block_mac: boolean;
+  supports_guest_wifi: boolean;
   supports_reboot: boolean;
   default_username: string | null;
   note: string;
@@ -89,6 +90,24 @@ export interface AppSettings {
   minimize_to_tray: boolean;
 }
 
+export interface ParentalRule {
+  id: string;
+  mac: string;
+  device_name: string;
+  start_hhmm: string;
+  end_hhmm: string;
+  enabled: boolean;
+  currently_enforced?: boolean;
+  last_notified_day?: string | null;
+}
+
+export interface GuestWifiState {
+  enabled: boolean;
+  ssid: string;
+  password: string;
+  auto_off_at: number | null;
+}
+
 export interface AppPreferences {
   onboarding_done: boolean;
   settings: AppSettings;
@@ -96,6 +115,9 @@ export interface AppPreferences {
   router_binding: RouterBinding | null;
   has_saved_router_password: boolean;
   router_connected: boolean;
+  parental_rules: ParentalRule[];
+  guest_wifi: GuestWifiState;
+  autostart_enabled: boolean;
 }
 
 export interface ScanResponse {

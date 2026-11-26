@@ -1,6 +1,6 @@
 [package]
 name = "wifi-buddy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Cross-platform desktop Wi-Fi helper for beginners"
 authors = ["tieke1121"]
 edition = "2024"

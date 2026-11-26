@@ -1,3 +1,4 @@
+mod autostart;
 mod network;
 mod oui;
 mod router;
@@ -16,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 use storage::{
     delete_router_password, load_router_password, load_store, now_unix_secs, save_router_password,
-    save_store, AppSettings, DeviceMeta, NetworkEvent, RouterBinding,
+    save_store, AppSettings, DeviceMeta, GuestWifiState, NetworkEvent, ParentalRule, RouterBinding,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -70,6 +71,9 @@ pub struct AppPreferences {
     pub router_binding: Option<RouterBinding>,
     pub has_saved_router_password: bool,
     pub router_connected: bool,
+    pub parental_rules: Vec<ParentalRule>,
+    pub guest_wifi: GuestWifiState,
+    pub autostart_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -359,6 +363,9 @@ fn get_app_preferences(state: State<'_, AppState>) -> AppPreferences {
         router_binding: store.router_binding,
         has_saved_router_password,
         router_connected,
+        parental_rules: store.parental_rules,
+        guest_wifi: store.guest_wifi,
+        autostart_enabled: autostart::is_autostart_enabled(),
     }
 }
 
@@ -564,6 +571,270 @@ fn reboot_router(state: State<'_, AppState>) -> Result<String, String> {
     Ok(msg)
 }
 
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<bool, String> {
+    autostart::set_autostart_enabled(enabled)
+}
+
+#[tauri::command]
+fn save_parental_rule(
+    state: State<'_, AppState>,
+    rule: ParentalRule,
+) -> Result<Vec<ParentalRule>, String> {
+    let norm_mac = normalize_mac(&rule.mac).unwrap_or_else(|| rule.mac.clone());
+    let mut store = load_store(&state.store_path);
+    let clean = ParentalRule {
+        mac: norm_mac,
+        ..rule
+    };
+    if let Some(pos) = store.parental_rules.iter().position(|r| r.id == clean.id) {
+        store.parental_rules[pos] = clean;
+    } else {
+        store.parental_rules.push(clean);
+    }
+    save_store(&state.store_path, &store)?;
+    Ok(store.parental_rules)
+}
+
+#[tauri::command]
+fn delete_parental_rule(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<ParentalRule>, String> {
+    let mut store = load_store(&state.store_path);
+    store.parental_rules.retain(|r| r.id != id);
+    save_store(&state.store_path, &store)?;
+    Ok(store.parental_rules)
+}
+
+#[tauri::command]
+fn set_guest_wifi(
+    state: State<'_, AppState>,
+    enabled: bool,
+    ssid: Option<String>,
+    password: Option<String>,
+    duration_mins: Option<u64>,
+) -> Result<GuestWifiState, String> {
+    let session = ensure_router_session(&state)?;
+    let adapter = get_adapter_by_id(&session.adapter_id)
+        .ok_or_else(|| "不支持的路由器适配器".to_string())?;
+    let clean_ssid = ssid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let clean_pw = password.as_deref().map(str::trim).map(String::from);
+    if enabled {
+        if let Some(ref pw) = clean_pw {
+            if !pw.is_empty() && pw.len() < 8 {
+                return Err("访客 Wi-Fi 如设置密码，至少需要 8 位字符".to_string());
+            }
+        }
+    }
+
+    let msg = adapter.set_guest_wifi(
+        &session,
+        enabled,
+        clean_ssid.as_deref(),
+        clean_pw.as_deref(),
+    )?;
+
+    let mut store = load_store(&state.store_path);
+    let auto_off_at = if enabled {
+        duration_mins
+            .filter(|m| *m > 0)
+            .map(|m| now_unix_secs() + m * 60)
+    } else {
+        None
+    };
+    store.guest_wifi = GuestWifiState {
+        enabled,
+        ssid: clean_ssid.unwrap_or_else(|| store.guest_wifi.ssid.clone()),
+        password: clean_pw.unwrap_or_else(|| store.guest_wifi.password.clone()),
+        auto_off_at,
+    };
+    save_store(&state.store_path, &store)?;
+    append_router_event(
+        &state,
+        if enabled {
+            format!("已开启访客 Wi-Fi：{}", store.guest_wifi.ssid)
+        } else {
+            "已关闭访客 Wi-Fi".to_string()
+        },
+        msg,
+    );
+    Ok(store.guest_wifi)
+}
+
+fn ensure_router_session_from_app(app: &AppHandle) -> Option<RouterSession> {
+    let state = app.try_state::<AppState>()?;
+    if let Ok(guard) = state.router_session.lock() {
+        if let Some(s) = guard.as_ref() {
+            return Some(s.clone());
+        }
+    }
+    let store = load_store(&state.store_path);
+    let binding = store.router_binding?;
+    let pw = load_router_password(&state.data_dir, &binding.gateway_ip)?;
+    let adapter = get_adapter_by_id(&binding.adapter_id)?;
+    let session = adapter
+        .authenticate(&binding.gateway_ip, binding.username.as_deref(), &pw)
+        .ok()?;
+    if let Ok(mut guard) = state.router_session.lock() {
+        *guard = Some(session.clone());
+    }
+    Some(session)
+}
+
+fn local_day_and_hhmm() -> Option<(String, String)> {
+    #[cfg(target_os = "windows")]
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd HH:mm'"])
+        .output()
+        .ok()?;
+    #[cfg(not(target_os = "windows"))]
+    let out = Command::new("date").args(["+%Y-%m-%d %H:%M"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (day, hhmm) = text.split_once(' ')?;
+    Some((day.to_string(), hhmm.to_string()))
+}
+
+fn hhmm_to_mins(hhmm: &str) -> Option<u32> {
+    let (h, m) = hhmm.trim().split_once(':')?;
+    let h_val = h.parse::<u32>().ok()?;
+    let m_val = m.parse::<u32>().ok()?;
+    if h_val >= 24 || m_val >= 60 {
+        return None;
+    }
+    Some(h_val * 60 + m_val)
+}
+
+pub fn is_in_time_window(now_hhmm: &str, start_hhmm: &str, end_hhmm: &str) -> bool {
+    let (Some(now), Some(start), Some(end)) = (
+        hhmm_to_mins(now_hhmm),
+        hhmm_to_mins(start_hhmm),
+        hhmm_to_mins(end_hhmm),
+    ) else {
+        return false;
+    };
+    if start == end {
+        return false;
+    }
+    if start < end {
+        now >= start && now < end
+    } else {
+        // 跨午夜时段，例如 23:00 -> 07:00
+        now >= start || now < end
+    }
+}
+
+fn process_guardian_schedules(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let mut store = load_store(&state.store_path);
+    let mut dirty = false;
+    let now = now_unix_secs();
+
+    // 1. 访客 Wi-Fi 定时自动关闭
+    if store.guest_wifi.enabled {
+        if let Some(off_at) = store.guest_wifi.auto_off_at {
+            if now >= off_at {
+                if let Some(session) = ensure_router_session_from_app(app) {
+                    if let Some(adapter) = get_adapter_by_id(&session.adapter_id) {
+                        if adapter.set_guest_wifi(&session, false, None, None).is_ok() {
+                            store.guest_wifi.enabled = false;
+                            store.guest_wifi.auto_off_at = None;
+                            store.events.insert(
+                                0,
+                                NetworkEvent {
+                                    timestamp: now,
+                                    kind: "router".to_string(),
+                                    title: "访客 Wi-Fi 已到期自动关闭".to_string(),
+                                    detail: format!("网络 {}", store.guest_wifi.ssid),
+                                },
+                            );
+                            send_desktop_notification("Wi-Fi 小管家", "临时访客 Wi-Fi 已到时间自动关闭");
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 夜间/家长断网规则检查
+    if !store.parental_rules.is_empty() {
+        if let Some((day, hhmm)) = local_day_and_hhmm() {
+            let session_opt = ensure_router_session_from_app(app);
+            let adapter_opt = session_opt
+                .as_ref()
+                .and_then(|s| get_adapter_by_id(&s.adapter_id));
+            let can_block = adapter_opt
+                .as_ref()
+                .map(|a| a.capabilities().supports_block_mac)
+                .unwrap_or(false);
+
+            for rule in &mut store.parental_rules {
+                if !rule.enabled {
+                    continue;
+                }
+                let active = is_in_time_window(&hhmm, &rule.start_hhmm, &rule.end_hhmm);
+                if active && !rule.currently_enforced {
+                    if can_block {
+                        if let (Some(session), Some(adapter)) = (&session_opt, &adapter_opt) {
+                            if adapter.block_mac(session, &rule.mac, true).is_ok() {
+                                rule.currently_enforced = true;
+                                store.events.insert(
+                                    0,
+                                    NetworkEvent {
+                                        timestamp: now,
+                                        kind: "router".to_string(),
+                                        title: format!("夜间守护：已暂停「{}」联网", rule.device_name),
+                                        detail: format!("时段 {} ~ {}", rule.start_hhmm, rule.end_hhmm),
+                                    },
+                                );
+                                dirty = true;
+                            }
+                        }
+                    } else if rule.last_notified_day.as_deref() != Some(&day) {
+                        rule.last_notified_day = Some(day.clone());
+                        send_desktop_notification(
+                            "Wi-Fi 小管家 · 夜间守护提醒",
+                            &format!("已到「{}」的休息时段（{}），请留意设备用网", rule.device_name, rule.start_hhmm),
+                        );
+                        dirty = true;
+                    }
+                } else if !active && rule.currently_enforced && can_block {
+                    if let (Some(session), Some(adapter)) = (&session_opt, &adapter_opt) {
+                        if adapter.block_mac(session, &rule.mac, false).is_ok() {
+                            rule.currently_enforced = false;
+                            store.events.insert(
+                                0,
+                                NetworkEvent {
+                                    timestamp: now,
+                                    kind: "router".to_string(),
+                                    title: format!("夜间守护结束：已恢复「{}」联网", rule.device_name),
+                                    detail: format!("恢复时间 {}", hhmm),
+                                },
+                            );
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if dirty {
+        store.events.truncate(50);
+        let _ = save_store(&state.store_path, &store);
+    }
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
@@ -640,10 +911,11 @@ pub fn run() {
                 quitting: AtomicBool::new(false),
             });
 
-            // 后台常驻静默巡检线程
+            // 后台常驻静默巡检 & 家长/访客守护调度线程
             let bg_handle = app.handle().clone();
             thread::spawn(move || {
                 let mut last_auto_scan = now_unix_secs();
+                let mut last_schedule_check = 0u64;
                 loop {
                     thread::sleep(Duration::from_secs(10));
                     let Some(state) = bg_handle.try_state::<AppState>() else {
@@ -652,12 +924,16 @@ pub fn run() {
                     if state.quitting.load(Ordering::SeqCst) {
                         break;
                     }
+                    let now = now_unix_secs();
+                    if now.saturating_sub(last_schedule_check) >= 30 {
+                        last_schedule_check = now;
+                        process_guardian_schedules(&bg_handle);
+                    }
                     let store = load_store(&state.store_path);
                     if !store.settings.auto_scan_enabled {
                         continue;
                     }
                     let interval = store.settings.scan_interval_secs.max(30);
-                    let now = now_unix_secs();
                     if now.saturating_sub(last_auto_scan) >= interval {
                         last_auto_scan = now;
                         if let Ok(res) = perform_scan(&bg_handle, true) {
@@ -700,8 +976,29 @@ pub fn run() {
             get_router_clients,
             update_router_wifi,
             router_block_device,
-            reboot_router
+            reboot_router,
+            set_autostart,
+            save_parental_rule,
+            delete_parental_rule,
+            set_guest_wifi
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_in_time_window() {
+        // 跨午夜时段 23:00 ~ 07:00
+        assert!(is_in_time_window("23:30", "23:00", "07:00"));
+        assert!(is_in_time_window("02:15", "23:00", "07:00"));
+        assert!(!is_in_time_window("12:00", "23:00", "07:00"));
+        assert!(!is_in_time_window("07:00", "23:00", "07:00"));
+        // 日间时段 14:00 ~ 16:00
+        assert!(is_in_time_window("14:30", "14:00", "16:00"));
+        assert!(!is_in_time_window("16:01", "14:00", "16:00"));
+    }
 }

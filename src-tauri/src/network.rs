@@ -395,6 +395,24 @@ fn probe_gateway_fingerprint(gateway_ip: &str, gateway_mac: Option<&str>) -> Rou
             "查看光猫/路由器背面贴纸上的默认管理账号和密码并登录".to_string(),
             "进入「网络 / WLAN 设置」即可修改 Wi-Fi 名称与密码".to_string(),
         ]
+    } else if brand.contains("小米") {
+        vec![
+            format!("可在「路由器与守护」输入管理员密码直接绑定小米路由器（http://{}）", gateway_ip),
+            "绑定后可直接改密、踢出陌生设备及开启访客 Wi-Fi".to_string(),
+            "也可使用手机「米家 App」或点击打开网页后台进行管理".to_string(),
+        ]
+    } else if brand.contains("TP-Link") {
+        vec![
+            format!("可在「路由器与守护」输入管理密码尝试绑定 TP-Link（http://{}）", gateway_ip),
+            "若新型号启用加密校验或 TP-Link ID，可点击下方直接打开网页后台".to_string(),
+            "登录后在「路由设置 → 无线设置」修改名称、密码或开启访客网络".to_string(),
+        ]
+    } else if brand.contains("华为") {
+        vec![
+            format!("点击打开华为管理后台（http://{}）或使用「智慧生活 App」", gateway_ip),
+            "输入路由器管理密码（部分型号与 Wi-Fi 密码相同）".to_string(),
+            "在「我要上网 / 我的 Wi-Fi」中修改密码或管理访客网络".to_string(),
+        ]
     } else if brand.contains("OpenWrt") {
         vec![
             format!("可在「路由器与守护」输入 root 密码直接绑定 OpenWrt（http://{}）", gateway_ip),

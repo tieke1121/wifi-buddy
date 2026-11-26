@@ -55,6 +55,39 @@ pub struct RouterBinding {
     pub bound_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParentalRule {
+    pub id: String,
+    pub mac: String,
+    pub device_name: String,
+    pub start_hhmm: String, // 例如 "23:00"
+    pub end_hhmm: String,   // 例如 "07:00"
+    pub enabled: bool,
+    #[serde(default)]
+    pub currently_enforced: bool,
+    #[serde(default)]
+    pub last_notified_day: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestWifiState {
+    pub enabled: bool,
+    pub ssid: String,
+    pub password: String,
+    pub auto_off_at: Option<u64>,
+}
+
+impl Default for GuestWifiState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssid: "MyHome_Guest".to_string(),
+            password: String::new(),
+            auto_off_at: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoreData {
     pub devices: HashMap<String, DeviceMeta>,
@@ -65,6 +98,10 @@ pub struct StoreData {
     pub events: Vec<NetworkEvent>,
     #[serde(default)]
     pub router_binding: Option<RouterBinding>,
+    #[serde(default)]
+    pub parental_rules: Vec<ParentalRule>,
+    #[serde(default)]
+    pub guest_wifi: GuestWifiState,
 }
 
 pub fn now_unix_secs() -> u64 {

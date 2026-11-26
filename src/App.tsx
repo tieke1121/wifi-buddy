@@ -113,6 +113,12 @@ export function App() {
   const [confirmingWifiSave, setConfirmingWifiSave] = useState(false);
   const [updatingWifi, setUpdatingWifi] = useState(false);
 
+  // 访客 Wi-Fi
+  const [guestSsid, setGuestSsid] = useState("MyHome_Guest");
+  const [guestPassword, setGuestPassword] = useState("");
+  const [guestDurationMins, setGuestDurationMins] = useState(240);
+  const [updatingGuest, setUpdatingGuest] = useState(false);
+
   // 体检与测速
   const [health, setHealth] = useState<HealthReport | null>(null);
   const [checkingHealth, setCheckingHealth] = useState(false);
@@ -147,6 +153,10 @@ export function App() {
       ]);
       setOverview(ov);
       setPreferences(prefs);
+      if (prefs.guest_wifi) {
+        setGuestSsid(prefs.guest_wifi.ssid || "MyHome_Guest");
+        setGuestPassword(prefs.guest_wifi.password || "");
+      }
       const initialSsid = ov.ssid || ov.preferred_ssids[0] || "";
       setSelectedSsid((prev) => prev || initialSsid);
       setNewWifiSsid((prev) => prev || initialSsid);
@@ -402,6 +412,53 @@ export function App() {
     setPreferences((prev) => (prev ? { ...prev, onboarding_done: true } : prev));
   }
 
+  async function handleToggleGuestWifi(enable: boolean) {
+    setUpdatingGuest(true);
+    try {
+      const state = await invoke("set_guest_wifi", {
+        enabled: enable,
+        ssid: guestSsid.trim() || null,
+        password: guestPassword.trim() || null,
+        durationMins: enable ? guestDurationMins : null,
+      });
+      await refreshPreferences();
+      if (enable) {
+        setSelectedSsid(guestSsid.trim() || "MyHome_Guest");
+        setWifiPassword(guestPassword.trim());
+        notify("已开启访客 Wi-Fi，右侧二维码已切换为访客网络");
+      } else {
+        notify("已关闭访客 Wi-Fi");
+      }
+      void state;
+    } catch (e) {
+      notify(String(e));
+    } finally {
+      setUpdatingGuest(false);
+    }
+  }
+
+  function handleCopyHealthReport() {
+    if (!overview) return;
+    const lines = [
+      `【Wi-Fi 小管家 · 网络诊断报告】`,
+      `生成时间：${new Date().toLocaleString("zh-CN")}`,
+      `路由器：${overview.router.brand} (${overview.router.gateway_ip})`,
+      `当前网络：${overview.ssid || "系统隐藏 SSID"} | ${overview.channel ?? "未知信道"} | 信号 ${overview.signal_dbm ?? "--"} dBm`,
+      health
+        ? `体检结论：${health.summary_title}（网关延迟 ${health.gateway_latency_ms ?? "--"} ms / 外网延迟 ${health.internet_latency_ms ?? "--"} ms）`
+        : "体检结论：尚未运行延迟体检",
+      speedResult?.download_mbps
+        ? `下行测速：${speedResult.download_mbps} Mbps（${speedResult.quality_label}，节点：${speedResult.source}）`
+        : "下行测速：尚未测速",
+      health ? `排查建议：${health.summary_advice}` : "",
+    ].filter(Boolean);
+
+    navigator.clipboard.writeText(lines.join("\n")).then(
+      () => notify("已复制完整诊断报告，可直接粘贴发给宽带客服或朋友"),
+      () => notify("复制失败，请手动查看页面结果")
+    );
+  }
+
   function handleCopyWifiCard() {
     if (!selectedSsid.trim()) {
       notify("请先填写 Wi-Fi 名称");
@@ -614,6 +671,15 @@ export function App() {
             )}
             {activeTab === "health" && (
               <>
+                {(health || speedResult) && (
+                  <button
+                    onClick={handleCopyHealthReport}
+                    className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-slate-50 dark:hover:bg-zinc-800 transition cursor-pointer"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    复制诊断报告
+                  </button>
+                )}
                 <button
                   onClick={handleRunSpeedTest}
                   disabled={testingSpeed}
@@ -1154,8 +1220,8 @@ export function App() {
                 </div>
               </div>
 
-              {/* 右侧：分享二维码通行卡 */}
-              <div className="lg:col-span-5">
+              {/* 右侧：分享二维码通行卡 + 临时访客 Wi-Fi */}
+              <div className="lg:col-span-5 space-y-5">
                 <div className="bg-gradient-to-b from-white to-slate-50 dark:from-zinc-900 dark:to-zinc-950 border border-slate-200/80 dark:border-zinc-800 rounded-3xl p-6 flex flex-col items-center text-center space-y-4 shadow-sm">
                   <div className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 px-3 py-1 rounded-full">
                     <Sparkles className="w-3.5 h-3.5" />
@@ -1180,8 +1246,82 @@ export function App() {
                   </div>
 
                   <p className="text-[11px] text-slate-400 dark:text-zinc-500 leading-relaxed max-w-xs">
-                    打开 iPhone 相机、安卓相机或微信扫一扫，对准上方二维码即可一键连入 Wi-Fi。
+                    请使用 iPhone 或安卓手机的系统自带相机扫码即可一键连入 Wi-Fi（微信扫一扫不支持直接连网，远程发送请点左侧「复制发微信」）。
                   </p>
+                </div>
+
+                {/* 临时访客 Wi-Fi 控制卡 */}
+                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-3 shadow-2xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-sm font-bold">临时访客 Wi-Fi</h3>
+                      <p className="text-[11px] text-slate-500 dark:text-zinc-400">
+                        客人来时开独立网络，到期自动关闭不泄密
+                      </p>
+                    </div>
+                    <span
+                      className={`text-[11px] px-2 py-0.5 rounded-full font-medium ${
+                        preferences?.guest_wifi?.enabled
+                          ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300"
+                          : "bg-slate-100 text-slate-500 dark:bg-zinc-800 dark:text-zinc-400"
+                      }`}
+                    >
+                      {preferences?.guest_wifi?.enabled ? "已开启" : "未开启"}
+                    </span>
+                  </div>
+
+                  {overview?.router.capabilities?.supports_guest_wifi && isRouterBound ? (
+                    <div className="space-y-2.5 text-xs">
+                      <div className="grid grid-cols-2 gap-2">
+                        <input
+                          value={guestSsid}
+                          onChange={(e) => setGuestSsid(e.target.value)}
+                          placeholder="访客网络名"
+                          className="px-2.5 py-1.5 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950"
+                        />
+                        <input
+                          value={guestPassword}
+                          onChange={(e) => setGuestPassword(e.target.value)}
+                          placeholder="密码(留空无密码)"
+                          className="px-2.5 py-1.5 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950"
+                        />
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <select
+                          value={guestDurationMins}
+                          onChange={(e) => setGuestDurationMins(Number(e.target.value))}
+                          className="px-2.5 py-1.5 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950"
+                        >
+                          <option value={120}>2 小时后自动关闭</option>
+                          <option value={240}>4 小时后自动关闭</option>
+                          <option value={720}>12 小时后自动关闭</option>
+                          <option value={0}>手动关闭</option>
+                        </select>
+                        <button
+                          type="button"
+                          disabled={updatingGuest}
+                          onClick={() => handleToggleGuestWifi(!preferences?.guest_wifi?.enabled)}
+                          className={`px-3 py-1.5 rounded-xl font-medium text-white cursor-pointer disabled:opacity-60 ${
+                            preferences?.guest_wifi?.enabled
+                              ? "bg-rose-600 hover:bg-rose-700"
+                              : "bg-blue-600 hover:bg-blue-700"
+                          }`}
+                        >
+                          {updatingGuest
+                            ? "处理中..."
+                            : preferences?.guest_wifi?.enabled
+                              ? "立即关闭访客网"
+                              : "开启并生成二维码"}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-500 dark:text-zinc-400 leading-relaxed">
+                      {overview?.router.capabilities?.supports_guest_wifi
+                        ? "请先去「路由器与守护」绑定管理员账号即可一键开关访客网络。"
+                        : "当前路由器暂不支持远程开关访客网络（支持小米 / TP-Link / OpenWrt），可在路由器网页后台中开启。"}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1327,6 +1467,7 @@ export function App() {
             <RouterGuardianTab
               overview={overview}
               preferences={preferences}
+              devices={scan?.devices ?? []}
               onOpenRouterAdmin={handleOpenRouterAdmin}
               onUpdateSettings={handleUpdateSettings}
               onClearEvents={handleClearEvents}

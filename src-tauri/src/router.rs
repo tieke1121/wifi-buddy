@@ -11,6 +11,8 @@ pub struct RouterCapabilities {
     pub supports_clients: bool,
     pub supports_wifi_config: bool,
     pub supports_block_mac: bool,
+    #[serde(default)]
+    pub supports_guest_wifi: bool,
     pub supports_reboot: bool,
     pub default_username: Option<String>,
     pub note: String,
@@ -69,23 +71,43 @@ pub trait RouterAdapter: Send + Sync {
         mac: &str,
         block: bool,
     ) -> Result<String, String>;
+    fn set_guest_wifi(
+        &self,
+        _session: &RouterSession,
+        _enabled: bool,
+        _ssid: Option<&str>,
+        _password: Option<&str>,
+    ) -> Result<String, String> {
+        Err("当前路由器型号暂不支持通过接口开关访客 Wi-Fi，请前往网页后台操作。".to_string())
+    }
     fn reboot(&self, session: &RouterSession) -> Result<String, String>;
 }
 
 pub struct OpenWrtAdapter;
 pub struct ZteAdapter;
+pub struct XiaomiAdapter;
+pub struct TpLinkAdapter;
+pub struct HuaweiAdapter;
 
 pub fn get_adapter_by_id(id: &str) -> Option<Box<dyn RouterAdapter>> {
     match id {
         "openwrt" => Some(Box::new(OpenWrtAdapter)),
         "zte" => Some(Box::new(ZteAdapter)),
+        "xiaomi" => Some(Box::new(XiaomiAdapter)),
+        "tplink" => Some(Box::new(TpLinkAdapter)),
+        "huawei" => Some(Box::new(HuaweiAdapter)),
         _ => None,
     }
 }
 
 pub fn match_router_adapter(info: &RouterProbeInfo) -> Option<Box<dyn RouterAdapter>> {
-    let adapters: Vec<Box<dyn RouterAdapter>> =
-        vec![Box::new(OpenWrtAdapter), Box::new(ZteAdapter)];
+    let adapters: Vec<Box<dyn RouterAdapter>> = vec![
+        Box::new(OpenWrtAdapter),
+        Box::new(XiaomiAdapter),
+        Box::new(TpLinkAdapter),
+        Box::new(HuaweiAdapter),
+        Box::new(ZteAdapter),
+    ];
     for adapter in adapters {
         if adapter.matches(info) {
             return Some(adapter);
@@ -289,9 +311,10 @@ impl RouterAdapter for OpenWrtAdapter {
             supports_clients: true,
             supports_wifi_config: true,
             supports_block_mac: true,
+            supports_guest_wifi: true,
             supports_reboot: true,
             default_username: Some("root".to_string()),
-            note: "已接入 OpenWrt LuCI 适配器：支持查看无线与 DHCP 终端、修改 Wi-Fi 密码、拉黑设备及重启（写操作需路由器已安装 luci-mod-rpc）。".to_string(),
+            note: "已接入 OpenWrt LuCI 适配器：支持查看无线与 DHCP 终端、修改 Wi-Fi 密码、访客网络、拉黑设备及重启（写操作需路由器已安装 luci-mod-rpc）。".to_string(),
         }
     }
 
@@ -567,6 +590,88 @@ impl RouterAdapter for OpenWrtAdapter {
         })
     }
 
+    fn set_guest_wifi(
+        &self,
+        session: &RouterSession,
+        enabled: bool,
+        ssid: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<String, String> {
+        if session.mode != "rpc" {
+            return Err("开关访客网络需要 OpenWrt 安装 luci-mod-rpc，或请在网页后台操作。".to_string());
+        }
+        let wireless = self.rpc_call(
+            &session.gateway_ip,
+            "uci",
+            &session.auth_token,
+            "get_all",
+            serde_json::json!(["wireless"]),
+        )?;
+        let mut guest_section: Option<String> = None;
+        if let Some(obj) = wireless.as_object() {
+            for (section, cfg) in obj {
+                if cfg.get(".type").and_then(|v| v.as_str()) == Some("wifi-iface") {
+                    let net = cfg.get("network").and_then(|v| v.as_str()).unwrap_or("");
+                    let s_name = cfg.get("ssid").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    if section.to_lowercase().contains("guest") || net == "guest" || s_name.contains("guest") {
+                        guest_section = Some(section.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(sec) = guest_section else {
+            return Err("未在 OpenWrt 无线配置中找到 guest 访客接口，请先在后台添加一个 guest 网络接口。".to_string());
+        };
+
+        let _ = self.rpc_call(
+            &session.gateway_ip,
+            "uci",
+            &session.auth_token,
+            "set",
+            serde_json::json!(["wireless", sec, "disabled", if enabled { "0" } else { "1" }]),
+        )?;
+        if enabled {
+            if let Some(s) = ssid.filter(|v| !v.trim().is_empty()) {
+                let _ = self.rpc_call(
+                    &session.gateway_ip,
+                    "uci",
+                    &session.auth_token,
+                    "set",
+                    serde_json::json!(["wireless", sec, "ssid", s.trim()]),
+                )?;
+            }
+            if let Some(pw) = password.filter(|v| v.len() >= 8) {
+                let _ = self.rpc_call(
+                    &session.gateway_ip,
+                    "uci",
+                    &session.auth_token,
+                    "set",
+                    serde_json::json!(["wireless", sec, "key", pw]),
+                )?;
+            }
+        }
+        self.rpc_call(
+            &session.gateway_ip,
+            "uci",
+            &session.auth_token,
+            "commit",
+            serde_json::json!(["wireless"]),
+        )?;
+        let _ = self.rpc_call(
+            &session.gateway_ip,
+            "sys",
+            &session.auth_token,
+            "exec",
+            serde_json::json!(["wifi reload"]),
+        );
+        Ok(if enabled {
+            "已开启 OpenWrt 访客 Wi-Fi".to_string()
+        } else {
+            "已关闭 OpenWrt 访客 Wi-Fi".to_string()
+        })
+    }
+
     fn reboot(&self, session: &RouterSession) -> Result<String, String> {
         if session.mode != "rpc" {
             return Err("当前 OpenWrt 未开启 luci-mod-rpc，请前往网页后台执行重启。".to_string());
@@ -727,6 +832,7 @@ impl RouterAdapter for ZteAdapter {
             supports_clients: true,
             supports_wifi_config: true,
             supports_block_mac: false,
+            supports_guest_wifi: false,
             supports_reboot: true,
             default_username: Some("admin".to_string()),
             note: "已接入中兴 zte.home 适配器：支持通用中兴管理页登录、读取已连终端、改密及重启；若为运营商定制光猫，受限于电信/移动/联通锁权，部分修改将自动切换为网页指引。".to_string(),
@@ -1040,9 +1146,865 @@ pub fn parse_zte_gch_clients(html: &str) -> Vec<RouterClientInfo> {
     out
 }
 
+// ============================================================================
+// 纯 Rust 轻量哈希辅助（SHA-1 / SHA-256，供小米/通用路由器登录挑战使用）
+// ============================================================================
+
+pub fn sha1_hex(input: &[u8]) -> String {
+    let mut h0: u32 = 0x67452301;
+    let mut h1: u32 = 0xEFCDAB89;
+    let mut h2: u32 = 0x98BADCFE;
+    let mut h3: u32 = 0x10325476;
+    let mut h4: u32 = 0xC3D2E1F0;
+
+    let mut msg = input.to_vec();
+    let bit_len = (input.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+    format!("{:08x}{:08x}{:08x}{:08x}{:08x}", h0, h1, h2, h3, h4)
+}
+
+pub fn sha256_hex(input: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let mut msg = input.to_vec();
+    let bit_len = (input.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    h.iter().map(|v| format!("{:08x}", v)).collect()
+}
+
+// ============================================================================
+// 小米 / Redmi 路由器适配器（MiWiFi LuCI JSON API）
+// ============================================================================
+
+impl XiaomiAdapter {
+    const MIWIFI_KEY: &'static str = "a2ffa5c9be07488bbb04a3a47d3c5f6a";
+
+    fn api_get(gateway_ip: &str, token: &str, path: &str) -> Result<Value, String> {
+        let full = format!("/cgi-bin/luci/;stok={}/api/{}", token, path);
+        let resp = http_request(gateway_ip, "GET", &full, None, None, None)?;
+        serde_json::from_str(&resp.body).map_err(|_| "小米路由器返回格式异常".to_string())
+    }
+
+    fn api_post(
+        gateway_ip: &str,
+        token: &str,
+        path: &str,
+        pairs: &[(&str, &str)],
+    ) -> Result<Value, String> {
+        let full = format!("/cgi-bin/luci/;stok={}/api/{}", token, path);
+        let body = form_urlencode(pairs);
+        let resp = http_request(
+            gateway_ip,
+            "POST",
+            &full,
+            Some("application/x-www-form-urlencoded"),
+            None,
+            Some(&body),
+        )?;
+        serde_json::from_str(&resp.body).map_err(|_| "小米路由器返回格式异常".to_string())
+    }
+}
+
+impl RouterAdapter for XiaomiAdapter {
+    fn id(&self) -> &'static str {
+        "xiaomi"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "小米 / Redmi 路由器 (MiWiFi)"
+    }
+
+    fn capabilities(&self) -> RouterCapabilities {
+        RouterCapabilities {
+            supports_clients: true,
+            supports_wifi_config: true,
+            supports_block_mac: true,
+            supports_guest_wifi: true,
+            supports_reboot: true,
+            default_username: Some("admin".to_string()),
+            note: "已接入小米 MiWiFi 适配器：支持读取终端列表、修改 Wi-Fi 密码、开关访客网络、拉黑设备及重启。".to_string(),
+        }
+    }
+
+    fn matches(&self, info: &RouterProbeInfo) -> bool {
+        let combined = format!(
+            "{} {} {}",
+            info.http_status_and_headers,
+            info.http_body,
+            info.page_title.unwrap_or("")
+        )
+        .to_lowercase();
+        info.mac_vendor == Some("小米 Xiaomi")
+            || combined.contains("miwifi")
+            || combined.contains("xiaoqiang")
+            || combined.contains("小米路由器")
+    }
+
+    fn authenticate(
+        &self,
+        gateway_ip: &str,
+        username: Option<&str>,
+        password: &str,
+    ) -> Result<RouterSession, String> {
+        let user = username
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("admin");
+
+        let init_resp = http_request(
+            gateway_ip,
+            "GET",
+            "/cgi-bin/luci/api/xqsystem/init_info",
+            None,
+            None,
+            None,
+        )
+        .ok();
+        let (device_id, encrypt_mode) = init_resp
+            .and_then(|r| serde_json::from_str::<Value>(&r.body).ok())
+            .map(|j| {
+                let id = j
+                    .get("id")
+                    .or_else(|| j.get("routerId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("00:00:00:00:00:00")
+                    .to_string();
+                let mode = j.get("newEncryptMode").and_then(|v| v.as_i64()).unwrap_or(0);
+                (id, mode)
+            })
+            .unwrap_or_else(|| ("00:00:00:00:00:00".to_string(), 0));
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1700000000);
+        let nonce = format!("0_{}_{}_{}", device_id, ts, (ts % 9000) + 1000);
+
+        let pwd_hash = if encrypt_mode == 1 {
+            let inner = sha256_hex(format!("{}{}", password, Self::MIWIFI_KEY).as_bytes());
+            sha256_hex(format!("{}{}", nonce, inner).as_bytes())
+        } else {
+            let inner = sha1_hex(format!("{}{}", password, Self::MIWIFI_KEY).as_bytes());
+            sha1_hex(format!("{}{}", nonce, inner).as_bytes())
+        };
+
+        let form = form_urlencode(&[
+            ("username", user),
+            ("password", &pwd_hash),
+            ("logtype", "2"),
+            ("nonce", &nonce),
+        ]);
+        let resp = http_request(
+            gateway_ip,
+            "POST",
+            "/cgi-bin/luci/api/xqsystem/login",
+            Some("application/x-www-form-urlencoded"),
+            None,
+            Some(&form),
+        )?;
+        let json: Value = serde_json::from_str(&resp.body)
+            .map_err(|_| "小米路由器登录接口响应异常".to_string())?;
+        if json.get("code").and_then(|c| c.as_i64()) == Some(0) {
+            if let Some(token) = json.get("token").and_then(|v| v.as_str()) {
+                return Ok(RouterSession {
+                    gateway_ip: gateway_ip.to_string(),
+                    adapter_id: "xiaomi".to_string(),
+                    auth_token: token.to_string(),
+                    cookie: None,
+                    username: user.to_string(),
+                    mode: "miwifi".to_string(),
+                });
+            }
+        }
+        Err("小米路由器密码校验失败，请核对管理密码（也可参考米家 App）".to_string())
+    }
+
+    fn list_clients(&self, session: &RouterSession) -> Result<Vec<RouterClientInfo>, String> {
+        let json = Self::api_get(&session.gateway_ip, &session.auth_token, "misystem/devicelist")?;
+        if json.get("code").and_then(|c| c.as_i64()) == Some(0) {
+            return Ok(parse_xiaomi_devicelist_json(&json));
+        }
+        Err("未能读取小米路由器终端列表".to_string())
+    }
+
+    fn update_wifi_config(
+        &self,
+        session: &RouterSession,
+        ssid: &str,
+        password: &str,
+    ) -> Result<String, String> {
+        if password.len() < 8 {
+            return Err("Wi-Fi 密码至少需要 8 位字符".to_string());
+        }
+        let mut updated = 0;
+        for idx in ["1", "2"] {
+            let res = Self::api_post(
+                &session.gateway_ip,
+                &session.auth_token,
+                "xqnetwork/set_wifi",
+                &[
+                    ("wifiIndex", idx),
+                    ("on", "1"),
+                    ("ssid", ssid),
+                    ("pwd", password),
+                    ("encryption", "mixed-psk"),
+                ],
+            );
+            if let Ok(v) = res {
+                if v.get("code").and_then(|c| c.as_i64()) == Some(0) {
+                    updated += 1;
+                }
+            }
+        }
+        if updated > 0 {
+            return Ok(format!("已更新小米路由器 {} 个频段的 Wi-Fi 名称与密码", updated));
+        }
+        Err("小米路由器未接受修改请求，请检查账号权限或前往网页后台保存".to_string())
+    }
+
+    fn block_mac(
+        &self,
+        session: &RouterSession,
+        mac: &str,
+        block: bool,
+    ) -> Result<String, String> {
+        let norm = normalize_mac(mac).ok_or_else(|| "无效的 MAC 地址".to_string())?;
+        let upper = norm.to_uppercase();
+        let res = Self::api_post(
+            &session.gateway_ip,
+            &session.auth_token,
+            "xqsystem/mac_filter",
+            &[
+                ("mac", &upper),
+                ("wan", if block { "0" } else { "1" }),
+            ],
+        )?;
+        if res.get("code").and_then(|c| c.as_i64()) == Some(0) {
+            return Ok(if block {
+                format!("已在小米路由器禁止 {} 上网", upper)
+            } else {
+                format!("已恢复 {} 的上网权限", upper)
+            });
+        }
+        Err("小米路由器黑名单设置未成功，请在米家 App 或网页后台确认".to_string())
+    }
+
+    fn set_guest_wifi(
+        &self,
+        session: &RouterSession,
+        enabled: bool,
+        ssid: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<String, String> {
+        let mut pairs = vec![("on", if enabled { "1" } else { "0" })];
+        if let Some(s) = ssid.filter(|v| !v.trim().is_empty()) {
+            pairs.push(("ssid", s.trim()));
+        }
+        if let Some(pw) = password.filter(|v| v.len() >= 8) {
+            pairs.push(("pwd", pw));
+            pairs.push(("encryption", "mixed-psk"));
+        } else if enabled {
+            pairs.push(("encryption", "none"));
+        }
+        let res = Self::api_post(
+            &session.gateway_ip,
+            &session.auth_token,
+            "xqnetwork/set_wifi_guest",
+            &pairs,
+        )?;
+        if res.get("code").and_then(|c| c.as_i64()) == Some(0) {
+            return Ok(if enabled {
+                "已开启小米路由器访客 Wi-Fi".to_string()
+            } else {
+                "已关闭小米路由器访客 Wi-Fi".to_string()
+            });
+        }
+        Err("访客 Wi-Fi 设置未成功，可能当前固件不支持该接口".to_string())
+    }
+
+    fn reboot(&self, session: &RouterSession) -> Result<String, String> {
+        let res = Self::api_get(
+            &session.gateway_ip,
+            &session.auth_token,
+            "xqsystem/reboot?client=web",
+        )?;
+        if res.get("code").and_then(|c| c.as_i64()) == Some(0) {
+            return Ok("已向小米路由器发送重启指令，约 1~2 分钟后恢复上网".to_string());
+        }
+        Err("小米路由器重启请求未成功".to_string())
+    }
+}
+
+pub fn parse_xiaomi_devicelist_json(json: &Value) -> Vec<RouterClientInfo> {
+    let Some(list) = json.get("list").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in list {
+        let mac_raw = item.get("mac").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(mac) = normalize_mac(mac_raw) {
+            let ip = item
+                .get("ip")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|obj| obj.get("ip"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let name = item
+                .get("name")
+                .or_else(|| item.get("oname"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let dev_type = item.get("type").and_then(|v| v.as_i64()).unwrap_or(0);
+            let band = match dev_type {
+                1 => Some("2.4G".to_string()),
+                2 | 6 => Some("5G".to_string()),
+                0 => Some("有线".to_string()),
+                _ => Some("Wi-Fi".to_string()),
+            };
+            out.push(RouterClientInfo {
+                ip,
+                mac,
+                name,
+                band,
+                signal_dbm: None,
+            });
+        }
+    }
+    out
+}
+
+// ============================================================================
+// TP-Link 适配器（Stok JSON /ds API）
+// ============================================================================
+
+impl TpLinkAdapter {
+    fn ds_call(gateway_ip: &str, stok: &str, payload: &Value) -> Result<Value, String> {
+        let path = format!("/stok={}/ds", stok);
+        let body = payload.to_string();
+        let resp = http_request(
+            gateway_ip,
+            "POST",
+            &path,
+            Some("application/json"),
+            None,
+            Some(&body),
+        )?;
+        serde_json::from_str(&resp.body).map_err(|_| "TP-Link 接口响应解析失败".to_string())
+    }
+}
+
+impl RouterAdapter for TpLinkAdapter {
+    fn id(&self) -> &'static str {
+        "tplink"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "TP-Link 路由器"
+    }
+
+    fn capabilities(&self) -> RouterCapabilities {
+        RouterCapabilities {
+            supports_clients: true,
+            supports_wifi_config: true,
+            supports_block_mac: true,
+            supports_guest_wifi: true,
+            supports_reboot: true,
+            default_username: Some("admin".to_string()),
+            note: "已接入 TP-Link 适配器（支持经典 Stok JSON 接口）；部分较新 RSA 加密固件将自动提示在网页后台操作。".to_string(),
+        }
+    }
+
+    fn matches(&self, info: &RouterProbeInfo) -> bool {
+        let combined = format!(
+            "{} {} {}",
+            info.http_status_and_headers,
+            info.http_body,
+            info.page_title.unwrap_or("")
+        )
+        .to_lowercase();
+        info.mac_vendor == Some("TP-Link")
+            || combined.contains("tp-link")
+            || combined.contains("tplogin")
+            || combined.contains("tplink")
+    }
+
+    fn authenticate(
+        &self,
+        gateway_ip: &str,
+        username: Option<&str>,
+        password: &str,
+    ) -> Result<RouterSession, String> {
+        let user = username
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("admin");
+
+        let login_payload = serde_json::json!({
+            "method": "do",
+            "login": { "password": password }
+        })
+        .to_string();
+        let resp = http_request(
+            gateway_ip,
+            "POST",
+            "/",
+            Some("application/json"),
+            None,
+            Some(&login_payload),
+        )?;
+        if let Ok(json) = serde_json::from_str::<Value>(&resp.body) {
+            if json.get("error_code").and_then(|v| v.as_i64()) == Some(0) {
+                if let Some(stok) = json.get("stok").and_then(|v| v.as_str()) {
+                    return Ok(RouterSession {
+                        gateway_ip: gateway_ip.to_string(),
+                        adapter_id: "tplink".to_string(),
+                        auth_token: stok.to_string(),
+                        cookie: None,
+                        username: user.to_string(),
+                        mode: "tplink_stok".to_string(),
+                    });
+                }
+            }
+            if json.pointer("/data/code").is_some() || json.get("error_code").and_then(|v| v.as_i64()) == Some(-40401) {
+                return Err("TP-Link 登录未通过：请核对密码；若为新加密固件请点击「网页后台」操作。".to_string());
+            }
+        }
+        Err("TP-Link 路由器登录失败，请核对管理密码或点击「网页后台」手动管理".to_string())
+    }
+
+    fn list_clients(&self, session: &RouterSession) -> Result<Vec<RouterClientInfo>, String> {
+        let payload = serde_json::json!({
+            "hosts_info": { "table": "online_host" },
+            "method": "get"
+        });
+        let json = Self::ds_call(&session.gateway_ip, &session.auth_token, &payload)?;
+        let list = parse_tplink_hosts_json(&json);
+        if !list.is_empty() {
+            return Ok(list);
+        }
+        Err("未从 TP-Link 读到终端列表".to_string())
+    }
+
+    fn update_wifi_config(
+        &self,
+        session: &RouterSession,
+        ssid: &str,
+        password: &str,
+    ) -> Result<String, String> {
+        if password.len() < 8 {
+            return Err("Wi-Fi 密码至少需要 8 位字符".to_string());
+        }
+        let payload = serde_json::json!({
+            "wireless": {
+                "wlan_host_2g": { "ssid": ssid, "key": password },
+                "wlan_host_5g": { "ssid": ssid, "key": password }
+            },
+            "method": "set"
+        });
+        let json = Self::ds_call(&session.gateway_ip, &session.auth_token, &payload)?;
+        if json.get("error_code").and_then(|v| v.as_i64()) == Some(0) {
+            return Ok("已更新 TP-Link Wi-Fi 名称与密码，请使用新密码重连。".to_string());
+        }
+        Err("TP-Link 改密未成功，请在网页后台确认".to_string())
+    }
+
+    fn block_mac(
+        &self,
+        session: &RouterSession,
+        mac: &str,
+        block: bool,
+    ) -> Result<String, String> {
+        let norm = normalize_mac(mac).ok_or_else(|| "无效的 MAC 地址".to_string())?;
+        let upper = norm.to_uppercase();
+        let payload = if block {
+            serde_json::json!({
+                "hosts_info": {
+                    "table": "online_host",
+                    "name": upper,
+                    "blocked": "1"
+                },
+                "method": "set"
+            })
+        } else {
+            serde_json::json!({
+                "hosts_info": {
+                    "table": "blocked_host",
+                    "name": upper,
+                    "blocked": "0"
+                },
+                "method": "set"
+            })
+        };
+        let json = Self::ds_call(&session.gateway_ip, &session.auth_token, &payload)?;
+        if json.get("error_code").and_then(|v| v.as_i64()) == Some(0) {
+            return Ok(if block {
+                format!("已在 TP-Link 拉黑 {}", upper)
+            } else {
+                format!("已在 TP-Link 解除拉黑 {}", upper)
+            });
+        }
+        Err("TP-Link 设备黑名单修改未成功".to_string())
+    }
+
+    fn set_guest_wifi(
+        &self,
+        session: &RouterSession,
+        enabled: bool,
+        ssid: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<String, String> {
+        let mut guest = serde_json::json!({
+            "enable": if enabled { "1" } else { "0" }
+        });
+        if let Some(s) = ssid.filter(|v| !v.trim().is_empty()) {
+            guest["ssid"] = Value::String(s.trim().to_string());
+        }
+        if let Some(pw) = password.filter(|v| v.len() >= 8) {
+            guest["key"] = Value::String(pw.to_string());
+        }
+        let payload = serde_json::json!({
+            "wireless": { "wlan_guest_2g": guest },
+            "method": "set"
+        });
+        let json = Self::ds_call(&session.gateway_ip, &session.auth_token, &payload)?;
+        if json.get("error_code").and_then(|v| v.as_i64()) == Some(0) {
+            return Ok(if enabled {
+                "已开启 TP-Link 访客 Wi-Fi".to_string()
+            } else {
+                "已关闭 TP-Link 访客 Wi-Fi".to_string()
+            });
+        }
+        Err("TP-Link 访客网络设置未成功".to_string())
+    }
+
+    fn reboot(&self, session: &RouterSession) -> Result<String, String> {
+        let payload = serde_json::json!({
+            "system": { "reboot": Value::Null },
+            "method": "do"
+        });
+        let json = Self::ds_call(&session.gateway_ip, &session.auth_token, &payload)?;
+        if json.get("error_code").and_then(|v| v.as_i64()) == Some(0) {
+            return Ok("已向 TP-Link 发送重启指令".to_string());
+        }
+        Err("TP-Link 重启指令未被接受".to_string())
+    }
+}
+
+pub fn parse_tplink_hosts_json(json: &Value) -> Vec<RouterClientInfo> {
+    let Some(arr) = json
+        .pointer("/hosts_info/online_host")
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in arr {
+        let obj = entry
+            .as_object()
+            .and_then(|m| m.values().next())
+            .unwrap_or(entry);
+        let mac_raw = obj.get("mac").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(mac) = normalize_mac(mac_raw) {
+            let ip = obj.get("ip").and_then(|v| v.as_str()).map(String::from);
+            let name = obj
+                .get("hostname")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let htype = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let band = if htype.contains("5") {
+                Some("5G".to_string())
+            } else if htype.contains("2") || htype.contains("1") {
+                Some("2.4G".to_string())
+            } else {
+                Some("有线/Wi-Fi".to_string())
+            };
+            out.push(RouterClientInfo {
+                ip,
+                mac,
+                name,
+                band,
+                signal_dbm: None,
+            });
+        }
+    }
+    out
+}
+
+// ============================================================================
+// 华为 / 荣耀适配器（HiLink API 识别与基础对接）
+// ============================================================================
+
+impl RouterAdapter for HuaweiAdapter {
+    fn id(&self) -> &'static str {
+        "huawei"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "华为 / 荣耀路由器 (HiLink)"
+    }
+
+    fn capabilities(&self) -> RouterCapabilities {
+        RouterCapabilities {
+            supports_clients: true,
+            supports_wifi_config: false,
+            supports_block_mac: false,
+            supports_guest_wifi: false,
+            supports_reboot: true,
+            default_username: Some("admin".to_string()),
+            note: "已识别华为 / 荣耀 HiLink 路由器：支持经典型号终端查看与重启；新款鸿蒙智联路由器采用 SCRAM 双向校验，改密建议使用「智慧生活 App」或点击打开网页后台。".to_string(),
+        }
+    }
+
+    fn matches(&self, info: &RouterProbeInfo) -> bool {
+        let combined = format!(
+            "{} {} {}",
+            info.http_status_and_headers,
+            info.http_body,
+            info.page_title.unwrap_or("")
+        )
+        .to_lowercase();
+        info.mac_vendor == Some("华为 Huawei")
+            || combined.contains("huawei")
+            || combined.contains("hilink")
+            || combined.contains("honor")
+            || combined.contains("华为")
+    }
+
+    fn authenticate(
+        &self,
+        gateway_ip: &str,
+        username: Option<&str>,
+        password: &str,
+    ) -> Result<RouterSession, String> {
+        let user = username
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("admin");
+
+        let info_resp = http_request(gateway_ip, "GET", "/api/system/deviceinfo", None, None, None)?;
+        if info_resp.status_code == 200 && info_resp.body.contains("MAC") {
+            return Ok(RouterSession {
+                gateway_ip: gateway_ip.to_string(),
+                adapter_id: "huawei".to_string(),
+                auth_token: password.to_string(),
+                cookie: info_resp.set_cookies.first().cloned(),
+                username: user.to_string(),
+                mode: "hilink".to_string(),
+            });
+        }
+
+        Err("当前华为路由器采用增强挑战认证，请点击「打开网页后台」或使用「智慧生活 App」进行管理。".to_string())
+    }
+
+    fn list_clients(&self, session: &RouterSession) -> Result<Vec<RouterClientInfo>, String> {
+        let resp = http_request(
+            &session.gateway_ip,
+            "GET",
+            "/api/system/HostInfo",
+            None,
+            session.cookie.as_deref(),
+            None,
+        )?;
+        if resp.status_code == 200 {
+            if let Ok(json) = serde_json::from_str::<Value>(&resp.body) {
+                let list = parse_huawei_hosts_json(&json);
+                if !list.is_empty() {
+                    return Ok(list);
+                }
+            }
+        }
+        Err("未从当前华为固件读取到终端列表，请以「谁在用我的网」扫描结果为准。".to_string())
+    }
+
+    fn update_wifi_config(
+        &self,
+        _session: &RouterSession,
+        _ssid: &str,
+        _password: &str,
+    ) -> Result<String, String> {
+        Err("华为新款路由器改密需使用 SCRAM 会话校验，请点击「打开网页后台」或用「智慧生活 App」修改。".to_string())
+    }
+
+    fn block_mac(
+        &self,
+        _session: &RouterSession,
+        _mac: &str,
+        _block: bool,
+    ) -> Result<String, String> {
+        Err("请点击「打开网页后台」在华为路由器终端管理中禁用设备。".to_string())
+    }
+
+    fn reboot(&self, session: &RouterSession) -> Result<String, String> {
+        let resp = http_request(
+            &session.gateway_ip,
+            "POST",
+            "/api/service/reboot.cgi",
+            Some("application/json"),
+            session.cookie.as_deref(),
+            Some("{}"),
+        )?;
+        if resp.status_code == 200 {
+            return Ok("已向华为路由器发送重启请求".to_string());
+        }
+        Err("当前华为型号限制了远程重启接口，请前往网页后台操作。".to_string())
+    }
+}
+
+pub fn parse_huawei_hosts_json(json: &Value) -> Vec<RouterClientInfo> {
+    let Some(arr) = json.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let mac_raw = item.get("MACAddress").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(mac) = normalize_mac(mac_raw) {
+            let ip = item.get("IPAddress").and_then(|v| v.as_str()).map(String::from);
+            let name = item
+                .get("HostName")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let layer = item.get("InterfaceType").and_then(|v| v.as_str()).unwrap_or("");
+            let band = if layer.contains("5G") {
+                Some("5G".to_string())
+            } else if layer.contains("2.4G") {
+                Some("2.4G".to_string())
+            } else {
+                Some("有线/Wi-Fi".to_string())
+            };
+            out.push(RouterClientInfo {
+                ip,
+                mac,
+                name,
+                band,
+                signal_dbm: None,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hashes_against_rfc_vectors() {
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn test_adapter_matching() {
@@ -1053,8 +2015,34 @@ mod tests {
             http_body: "<title>LuCI - OpenWrt</title>",
             page_title: Some("LuCI - OpenWrt"),
         };
-        let matched = match_router_adapter(&openwrt_info).unwrap();
-        assert_eq!(matched.id(), "openwrt");
+        assert_eq!(match_router_adapter(&openwrt_info).unwrap().id(), "openwrt");
+
+        let xiaomi_info = RouterProbeInfo {
+            gateway_ip: "192.168.31.1",
+            mac_vendor: Some("小米 Xiaomi"),
+            http_status_and_headers: "HTTP/1.1 200 OK",
+            http_body: "<title>小米路由器</title>",
+            page_title: Some("小米路由器"),
+        };
+        assert_eq!(match_router_adapter(&xiaomi_info).unwrap().id(), "xiaomi");
+
+        let tplink_info = RouterProbeInfo {
+            gateway_ip: "192.168.1.1",
+            mac_vendor: Some("TP-Link"),
+            http_status_and_headers: "HTTP/1.1 200 OK",
+            http_body: "<title>TP-LINK</title>",
+            page_title: Some("TP-LINK"),
+        };
+        assert_eq!(match_router_adapter(&tplink_info).unwrap().id(), "tplink");
+
+        let huawei_info = RouterProbeInfo {
+            gateway_ip: "192.168.3.1",
+            mac_vendor: Some("华为 Huawei"),
+            http_status_and_headers: "HTTP/1.1 200 OK",
+            http_body: "<title>HUAWEI HiLink</title>",
+            page_title: Some("HUAWEI HiLink"),
+        };
+        assert_eq!(match_router_adapter(&huawei_info).unwrap().id(), "huawei");
 
         let zte_info = RouterProbeInfo {
             gateway_ip: "192.168.5.1",
@@ -1063,8 +2051,7 @@ mod tests {
             http_body: "<title>ZXHN F7607P</title>",
             page_title: Some("ZXHN F7607P"),
         };
-        let matched_zte = match_router_adapter(&zte_info).unwrap();
-        assert_eq!(matched_zte.id(), "zte");
+        assert_eq!(match_router_adapter(&zte_info).unwrap().id(), "zte");
     }
 
     #[test]
@@ -1100,5 +2087,36 @@ mod tests {
         let clients = parse_zte_gch_clients(html);
         assert_eq!(clients.len(), 2);
         assert_eq!(clients[0].mac, "c4:92:d9:11:22:33");
+    }
+
+    #[test]
+    fn test_parse_xiaomi_tplink_huawei_clients() {
+        let xm = serde_json::json!({
+            "code": 0,
+            "list": [
+                { "mac": "AA:BB:CC:00:11:22", "name": "iPad", "type": 2, "ip": [{"ip": "192.168.31.12"}] }
+            ]
+        });
+        let xm_res = parse_xiaomi_devicelist_json(&xm);
+        assert_eq!(xm_res.len(), 1);
+        assert_eq!(xm_res[0].band.as_deref(), Some("5G"));
+
+        let tp = serde_json::json!({
+            "hosts_info": {
+                "online_host": [
+                    { "h1": { "mac": "11-22-33-44-55-66", "ip": "192.168.1.10", "hostname": "MacBook", "type": "5G" } }
+                ]
+            }
+        });
+        let tp_res = parse_tplink_hosts_json(&tp);
+        assert_eq!(tp_res.len(), 1);
+        assert_eq!(tp_res[0].mac, "11:22:33:44:55:66");
+
+        let hw = serde_json::json!([
+            { "MACAddress": "22:33:44:55:66:77", "IPAddress": "192.168.3.8", "HostName": "MatePad", "InterfaceType": "5G" }
+        ]);
+        let hw_res = parse_huawei_hosts_json(&hw);
+        assert_eq!(hw_res.len(), 1);
+        assert_eq!(hw_res[0].name.as_deref(), Some("MatePad"));
     }
 }
