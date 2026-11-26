@@ -1,7 +1,7 @@
+#[cfg(target_os = "windows")]
+use crate::cmd_util::hidden_command;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
-#[cfg(target_os = "windows")]
-use std::process::Command;
 
 #[cfg(target_os = "macos")]
 fn macos_plist_path() -> Option<PathBuf> {
@@ -22,7 +22,7 @@ pub fn is_autostart_enabled() -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        return Command::new("reg")
+        return hidden_command("reg")
             .args([
                 "query",
                 "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -86,7 +86,7 @@ pub fn set_autostart_enabled(enabled: bool) -> Result<bool, String> {
             let exe = std::env::current_exe()
                 .map_err(|e| format!("获取当前程序路径失败: {}", e))?;
             let quoted = format!("\"{}\"", exe.to_string_lossy());
-            let out = Command::new("reg")
+            let out = hidden_command("reg")
                 .args(["add", key, "/v", "WiFiBuddy", "/t", "REG_SZ", "/d", &quoted, "/f"])
                 .output()
                 .map_err(|e| format!("写入 Windows 注册表失败: {}", e))?;
@@ -96,7 +96,7 @@ pub fn set_autostart_enabled(enabled: bool) -> Result<bool, String> {
                 Err("设置 Windows 开机自启失败".to_string())
             }
         } else {
-            let _ = Command::new("reg")
+            let _ = hidden_command("reg")
                 .args(["delete", key, "/v", "WiFiBuddy", "/f"])
                 .output();
             Ok(false)

@@ -57,6 +57,37 @@ export interface NetworkOverview {
   router: RouterFingerprint;
 }
 
+export interface CapabilityAction {
+  id: string;
+  label: string;
+  description: string;
+  style: "primary" | "secondary" | "subtle" | string;
+  url: string | null;
+  disabled: boolean;
+  badge: string | null;
+}
+
+export interface HardwareProfile {
+  adapter_id: string;
+  kind: "router" | "printer" | "smarthome" | "camera" | "media" | string;
+  category_label: string;
+  model: string | null;
+  manufacturer: string | null;
+  status_text: string;
+  services: string[];
+  admin_url: string | null;
+  system_installed: boolean | null;
+  system_printer_name: string | null;
+  actions: CapabilityAction[];
+}
+
+export interface HardwareActionResult {
+  success: boolean;
+  message: string;
+  detail: string | null;
+  refresh_needed: boolean;
+}
+
 export interface DeviceView {
   ip: string;
   mac: string;
@@ -65,7 +96,7 @@ export interface DeviceView {
   alias: string | null;
   vendor: string;
   hostname: string | null;
-  device_type: "laptop" | "phone" | "router" | "iot" | string;
+  device_type: "laptop" | "phone" | "router" | "printer" | "camera" | "smarthome" | "media" | "iot" | string;
   is_self: boolean;
   is_gateway: boolean;
   is_randomized_mac: boolean;
@@ -74,6 +105,7 @@ export interface DeviceView {
   trusted: boolean;
   blocked: boolean;
   is_new: boolean;
+  hardware?: HardwareProfile | null;
 }
 
 export interface NetworkEvent {

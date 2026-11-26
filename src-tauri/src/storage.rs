@@ -1,8 +1,8 @@
+use crate::cmd_util::hidden_command;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -55,6 +55,24 @@ pub struct RouterBinding {
     pub bound_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HardwareBinding {
+    pub mac: String,
+    pub ip: String,
+    pub adapter_id: String,
+    pub kind: String,
+    pub label: Option<String>,
+    pub bound_at: u64,
+    #[serde(default)]
+    pub vendor: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub system_printer_name: Option<String>,
+    #[serde(default)]
+    pub admin_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParentalRule {
     pub id: String,
@@ -99,6 +117,8 @@ pub struct StoreData {
     #[serde(default)]
     pub router_binding: Option<RouterBinding>,
     #[serde(default)]
+    pub hardware_bindings: HashMap<String, HardwareBinding>,
+    #[serde(default)]
     pub parental_rules: Vec<ParentalRule>,
     #[serde(default)]
     pub guest_wifi: GuestWifiState,
@@ -134,7 +154,7 @@ pub fn save_router_password(data_dir: &Path, gateway_ip: &str, password: &str) -
     #[cfg(target_os = "macos")]
     {
         let _ = data_dir;
-        let status = Command::new("security")
+        let status = hidden_command("security")
             .args([
                 "add-generic-password",
                 "-U",
@@ -166,7 +186,7 @@ pub fn save_router_password(data_dir: &Path, gateway_ip: &str, password: &str) -
             password.replace('\'', "''"),
             cred_file.to_string_lossy().replace('\'', "''")
         );
-        let out = Command::new("powershell")
+        let out = hidden_command("powershell")
             .args(["-NoProfile", "-Command", &ps])
             .output()
             .map_err(|e| format!("调用 Windows 安全存储失败: {}", e))?;
@@ -187,7 +207,7 @@ pub fn load_router_password(data_dir: &Path, gateway_ip: &str) -> Option<String>
     #[cfg(target_os = "macos")]
     {
         let _ = data_dir;
-        let out = Command::new("security")
+        let out = hidden_command("security")
             .args([
                 "find-generic-password",
                 "-a",
@@ -220,7 +240,7 @@ pub fn load_router_password(data_dir: &Path, gateway_ip: &str) -> Option<String>
             "$enc = Get-Content -Path '{}' -Raw; $sec = ConvertTo-SecureString $enc; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))",
             cred_file.to_string_lossy().replace('\'', "''")
         );
-        let out = Command::new("powershell")
+        let out = hidden_command("powershell")
             .args(["-NoProfile", "-Command", &ps])
             .output()
             .ok()?;
@@ -244,7 +264,7 @@ pub fn delete_router_password(data_dir: &Path, gateway_ip: &str) {
     #[cfg(target_os = "macos")]
     {
         let _ = data_dir;
-        let _ = Command::new("security")
+        let _ = hidden_command("security")
             .args([
                 "delete-generic-password",
                 "-a",
@@ -283,5 +303,28 @@ mod tests {
         assert_eq!(parsed.settings.scan_interval_secs, 180);
         assert!(parsed.settings.minimize_to_tray);
         assert!(parsed.router_binding.is_none());
+
+        let with_binding = r#"{
+            "devices": {},
+            "onboarding_done": true,
+            "hardware_bindings": {
+                "a4:d7:3c:53:f6:35": {
+                    "mac": "a4:d7:3c:53:f6:35",
+                    "ip": "192.168.5.67",
+                    "adapter_id": "network_printer",
+                    "kind": "printer",
+                    "label": "Epson L3250",
+                    "bound_at": 1700000000
+                }
+            }
+        }"#;
+        let parsed_binding: StoreData = serde_json::from_str(with_binding).unwrap();
+        let b = parsed_binding
+            .hardware_bindings
+            .get("a4:d7:3c:53:f6:35")
+            .unwrap();
+        assert_eq!(b.ip, "192.168.5.67");
+        assert!(b.model.is_none());
+        assert!(b.system_printer_name.is_none());
     }
 }

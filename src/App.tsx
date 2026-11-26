@@ -32,11 +32,16 @@ import {
 } from "lucide-react";
 import { OnboardingModal } from "./components/OnboardingModal";
 import { RouterGuardianTab } from "./components/RouterGuardianTab";
+import { HardwareCardsSection, HardwareKindIcon } from "./components/HardwareCardsSection";
+import { HardwareDrawer } from "./components/HardwareDrawer";
 import { evaluatePasswordStrength, generateMemorablePassword } from "./utils/password";
 import type {
   AppPreferences,
   AppSettings,
+  CapabilityAction,
   DeviceView,
+  HardwareActionResult,
+  HardwareProfile,
   HealthReport,
   NetworkOverview,
   ScanResponse,
@@ -45,7 +50,7 @@ import type {
 } from "./types";
 
 type TabId = "devices" | "share" | "health" | "router";
-type DeviceFilter = "all" | "new" | "personal" | "iot" | "blocked";
+type DeviceFilter = "all" | "hardware" | "new" | "personal" | "iot" | "blocked";
 
 function getSignalMeta(dbm: number | null) {
   if (dbm === null) return { label: "信号检测中", bars: 2, color: "text-slate-400" };
@@ -97,6 +102,13 @@ export function App() {
 
   const [renamingDevice, setRenamingDevice] = useState<DeviceView | null>(null);
   const [renameInput, setRenameInput] = useState("");
+
+  // 家庭硬件管理抽屉状态
+  const [activeHardwareMac, setActiveHardwareMac] = useState<string | null>(null);
+  const [runningHardwareKey, setRunningHardwareKey] = useState<string | null>(null);
+  const [refreshingHardware, setRefreshingHardware] = useState(false);
+  const [hardwareActionResult, setHardwareActionResult] =
+    useState<HardwareActionResult | null>(null);
 
   // 分享与改密
   const [selectedSsid, setSelectedSsid] = useState("");
@@ -383,6 +395,93 @@ export function App() {
     }
   }
 
+  function handleOpenHardwareDrawer(device: DeviceView) {
+    setHardwareActionResult(null);
+    setActiveHardwareMac(device.mac);
+  }
+
+  async function handleRefreshSingleHardware(device: DeviceView) {
+    setRefreshingHardware(true);
+    try {
+      const updated = await invoke<HardwareProfile | null>("probe_single_hardware", {
+        ip: device.ip,
+        mac: device.mac,
+        vendor: device.vendor,
+        hostname: device.hostname,
+        isGateway: device.is_gateway,
+      });
+      setScan((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          devices: prev.devices.map((item) =>
+            item.mac === device.mac ? { ...item, hardware: updated } : item
+          ),
+        };
+      });
+      notify("已刷新硬件实时状态");
+    } catch (e) {
+      notify(`刷新硬件状态失败：${String(e)}`);
+    } finally {
+      setRefreshingHardware(false);
+    }
+  }
+
+  async function handleRunHardwareAction(
+    device: DeviceView,
+    action: CapabilityAction
+  ) {
+    if (action.id === "open_router_tab") {
+      setActiveHardwareMac(null);
+      setActiveTab("router");
+      return;
+    }
+    if (action.url) {
+      try {
+        await openUrl(action.url);
+      } catch (e) {
+        notify(`打开链接失败：${String(e)}`);
+      }
+      return;
+    }
+
+    const key = `${device.mac}:${action.id}`;
+    setRunningHardwareKey(key);
+    setHardwareActionResult(null);
+    try {
+      const res = await invoke<HardwareActionResult>("execute_hardware_action", {
+        ip: device.ip,
+        mac: device.mac,
+        actionId: action.id,
+        params: {
+          display_name: device.display_name,
+          system_printer_name: device.hardware?.system_printer_name ?? null,
+        },
+      });
+      setHardwareActionResult(res);
+      if (res.success || !activeHardwareMac) {
+        notify(res.message);
+      } else {
+        notify("未能自动完成添加，请按抽屉内提示操作");
+      }
+      if (res.refresh_needed) {
+        await handleRefreshSingleHardware(device);
+        await refreshPreferences();
+      }
+    } catch (e) {
+      const errRes: HardwareActionResult = {
+        success: false,
+        message: String(e),
+        detail: null,
+        refresh_needed: false,
+      };
+      setHardwareActionResult(errRes);
+      notify(String(e));
+    } finally {
+      setRunningHardwareKey(null);
+    }
+  }
+
   async function handleUpdateSettings(next: AppSettings) {
     try {
       const saved = await invoke<AppSettings>("update_app_settings", { settings: next });
@@ -483,6 +582,7 @@ export function App() {
     return list.filter((d) => {
       if (filter === "blocked") return d.blocked;
       if (d.blocked) return false;
+      if (filter === "hardware" && !d.hardware) return false;
       if (filter === "new" && !d.is_new) return false;
       if (filter === "personal" && d.device_type !== "phone" && d.device_type !== "laptop") {
         return false;
@@ -514,6 +614,19 @@ export function App() {
     [scan]
   );
 
+  const hardwareCount = useMemo(
+    () => (scan?.devices ?? []).filter((d) => !d.blocked && Boolean(d.hardware)).length,
+    [scan]
+  );
+
+  const activeHardwareDevice = useMemo(
+    () =>
+      activeHardwareMac
+        ? (scan?.devices ?? []).find((d) => d.mac === activeHardwareMac) ?? null
+        : null,
+    [scan, activeHardwareMac]
+  );
+
   const sigMeta = getSignalMeta(overview?.signal_dbm ?? null);
   const newPwStrength = evaluatePasswordStrength(newWifiPassword);
   const isRouterBound = Boolean(
@@ -528,10 +641,10 @@ export function App() {
 
   const tabMeta: Record<TabId, { title: string; subtitle: string }> = {
     devices: {
-      title: "谁在用我的网",
+      title: "家庭硬件与雷达",
       subtitle: overview
-        ? `子网 ${overview.subnet_cidr} · 已结合 ARP / mDNS / SSDP 自动识别智能设备`
-        : "正在扫描局域网活跃设备...",
+        ? `子网 ${overview.subnet_cidr} · 自动识别路由器、Wi-Fi 打印机与智能设备`
+        : "正在扫描局域网活跃硬件与终端...",
     },
     share: {
       title: "扫码连网与改密码",
@@ -573,7 +686,7 @@ export function App() {
               [
                 {
                   id: "devices",
-                  label: "谁在用我的网",
+                  label: "家庭硬件与雷达",
                   icon: Radar,
                   badge: (scan?.new_count ?? 0) > 0 ? `${scan?.new_count}` : null,
                 },
@@ -736,7 +849,7 @@ export function App() {
                     <span className="text-xs font-normal text-slate-400 ml-1">台</span>
                   </div>
                   <div className="text-[11px] text-slate-500 dark:text-zinc-400 mt-1.5">
-                    手机/电脑 {personalCount} · 固定/家居 {iotCount}
+                    可管理硬件 {hardwareCount} · 手机电脑 {personalCount} · 固定 {iotCount}
                   </div>
                 </div>
 
@@ -772,6 +885,14 @@ export function App() {
                 </div>
               </div>
 
+              {/* 可管理家庭硬件卡片区 */}
+              <HardwareCardsSection
+                devices={scan?.devices ?? []}
+                runningKey={runningHardwareKey}
+                onOpenDrawer={handleOpenHardwareDrawer}
+                onRunAction={handleRunHardwareAction}
+              />
+
               {/* 列表卡片 */}
               <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl shadow-2xs overflow-hidden">
                 <div className="px-4 py-3 border-b border-slate-100 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-3">
@@ -779,6 +900,7 @@ export function App() {
                     {(
                       [
                         ["all", "全部"],
+                        ["hardware", "可管理硬件"],
                         ["new", "陌生设备"],
                         ["personal", "手机/电脑"],
                         ["iot", "固定/家居"],
@@ -855,7 +977,11 @@ export function App() {
                                     : "bg-slate-100 text-slate-600 dark:bg-zinc-800 dark:text-zinc-300"
                             }`}
                           >
-                            <DeviceIcon type={d.device_type} />
+                            {d.hardware ? (
+                              <HardwareKindIcon kind={d.hardware.kind} />
+                            ) : (
+                              <DeviceIcon type={d.device_type} />
+                            )}
                           </div>
 
                           <div className="min-w-0">
@@ -863,6 +989,11 @@ export function App() {
                               <span className="text-[13px] font-semibold truncate">
                                 {d.display_name}
                               </span>
+                              {d.hardware && !d.is_gateway && (
+                                <span className="text-[11px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300 font-medium">
+                                  {d.hardware.category_label}
+                                </span>
+                              )}
                               {d.is_self && (
                                 <span className="text-[11px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300 font-medium">
                                   本机
@@ -914,6 +1045,14 @@ export function App() {
                         <div className="flex items-center gap-1.5 shrink-0">
                           {!d.blocked ? (
                             <>
+                              {d.hardware && (
+                                <button
+                                  onClick={() => handleOpenHardwareDrawer(d)}
+                                  className="text-xs font-medium px-2.5 py-1.5 rounded-lg bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-500/15 dark:text-blue-300 transition cursor-pointer"
+                                >
+                                  管理
+                                </button>
+                              )}
                               {d.is_new && (
                                 <button
                                   onClick={() => handleTrustDevice(d)}
@@ -1500,6 +1639,22 @@ export function App() {
           </button>
         </div>
       )}
+
+      {/* 右侧硬件管理详情抽屉 */}
+      <HardwareDrawer
+        device={activeHardwareDevice}
+        runningKey={runningHardwareKey}
+        refreshing={refreshingHardware}
+        lastResult={hardwareActionResult}
+        onClose={() => setActiveHardwareMac(null)}
+        onRunAction={handleRunHardwareAction}
+        onRefreshSingle={handleRefreshSingleHardware}
+        onRename={(d) => {
+          setRenamingDevice(d);
+          setRenameInput(d.alias ?? d.display_name);
+        }}
+        notify={notify}
+      />
 
       {/* 重命名弹窗 */}
       {renamingDevice && (

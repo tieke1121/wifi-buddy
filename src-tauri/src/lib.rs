@@ -1,23 +1,37 @@
 mod autostart;
+mod cmd_util;
+mod hardware;
+mod hardware_probe;
 mod network;
 mod oui;
 mod router;
 mod ssdp;
 mod storage;
 
+use cmd_util::hidden_command;
+use hardware::{
+    build_restored_printer_profile, execute_hardware_action_impl, probe_single_hardware_profile,
+    HardwareActionResult, HardwareProfile,
+};
+use hardware_probe::{
+    extract_network_printer_ips, extract_printer_ipv4, find_matching_installed_printer,
+    list_installed_printers, InstalledPrinter,
+};
 use network::{HealthReport, NetworkOverview, RawLanDevice, SpeedTestResult, WifiPasswordResult};
 use oui::normalize_mac;
 use router::{get_adapter_by_id, RouterClientInfo, RouterSession};
 use serde::Serialize;
+use serde_json::Value;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use storage::{
     delete_router_password, load_router_password, load_store, now_unix_secs, save_router_password,
-    save_store, AppSettings, DeviceMeta, GuestWifiState, NetworkEvent, ParentalRule, RouterBinding,
+    save_store, AppSettings, DeviceMeta, GuestWifiState, HardwareBinding, NetworkEvent,
+    ParentalRule, RouterBinding,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -50,6 +64,7 @@ pub struct DeviceView {
     pub trusted: bool,
     pub blocked: bool,
     pub is_new: bool,
+    pub hardware: Option<HardwareProfile>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,7 +108,7 @@ fn send_desktop_notification(title: &str, body: &str) {
             esc(body),
             esc(title)
         );
-        let _ = Command::new("osascript").args(["-e", &script]).spawn();
+        let _ = hidden_command("osascript").args(["-e", &script]).spawn();
     }
 
     #[cfg(target_os = "windows")]
@@ -110,7 +125,7 @@ fn send_desktop_notification(title: &str, body: &str) {
             esc(title),
             esc(body)
         );
-        let _ = Command::new("powershell")
+        let _ = hidden_command("powershell")
             .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
             .spawn();
     }
@@ -148,6 +163,241 @@ fn update_tray_indicator(app: &AppHandle, total_clients: usize, new_count: usize
     }
 }
 
+fn collect_known_hardware_ips(
+    store: &storage::StoreData,
+    installed_printers: &[InstalledPrinter],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ips = Vec::new();
+    for binding in store.hardware_bindings.values() {
+        let ip = binding.ip.trim().to_string();
+        if !ip.is_empty() && seen.insert(ip.clone()) {
+            ips.push(ip);
+        }
+    }
+    for ip in extract_network_printer_ips(installed_printers) {
+        if seen.insert(ip.clone()) {
+            ips.push(ip);
+        }
+    }
+    ips
+}
+
+fn sync_printer_bindings_from_scan(
+    store: &mut storage::StoreData,
+    devices: &[DeviceView],
+    now: u64,
+) {
+    for d in devices {
+        let Some(ref hw) = d.hardware else {
+            continue;
+        };
+        if hw.kind != "printer" {
+            continue;
+        }
+        let already_bound = store.hardware_bindings.contains_key(&d.mac);
+        let is_installed = hw.system_installed == Some(true);
+        if !already_bound && !is_installed {
+            continue;
+        }
+        let prev = store.hardware_bindings.get(&d.mac).cloned();
+        store.hardware_bindings.insert(
+            d.mac.clone(),
+            HardwareBinding {
+                mac: d.mac.clone(),
+                ip: d.ip.clone(),
+                adapter_id: hw.adapter_id.clone(),
+                kind: "printer".to_string(),
+                label: Some(d.display_name.clone()),
+                bound_at: prev.as_ref().map(|p| p.bound_at).unwrap_or(now),
+                vendor: hw
+                    .manufacturer
+                    .clone()
+                    .or_else(|| Some(d.vendor.clone()))
+                    .or_else(|| prev.as_ref().and_then(|p| p.vendor.clone())),
+                model: hw
+                    .model
+                    .clone()
+                    .or_else(|| prev.as_ref().and_then(|p| p.model.clone())),
+                system_printer_name: hw
+                    .system_printer_name
+                    .clone()
+                    .or_else(|| prev.as_ref().and_then(|p| p.system_printer_name.clone())),
+                admin_url: hw
+                    .admin_url
+                    .clone()
+                    .or_else(|| prev.as_ref().and_then(|p| p.admin_url.clone())),
+            },
+        );
+    }
+}
+
+/// 将持久化记录与本机已安装网络打印机合并进扫描结果，确保重启或打印机休眠时不丢失显示
+fn merge_restored_printers(
+    devices: &mut Vec<DeviceView>,
+    store: &storage::StoreData,
+    installed_printers: &[InstalledPrinter],
+) -> HashSet<String> {
+    let mut restored_macs = HashSet::new();
+
+    // 1. 先检查本次扫描已在线、但因探测超时导致未识别为打印机的已绑定设备
+    for dev in devices.iter_mut() {
+        if dev.hardware.as_ref().map(|h| h.kind == "printer").unwrap_or(false) {
+            continue;
+        }
+        if let Some(binding) = store.hardware_bindings.get(&dev.mac) {
+            if binding.kind == "printer" {
+                let model = binding
+                    .model
+                    .as_deref()
+                    .or(binding.label.as_deref())
+                    .or(binding.system_printer_name.as_deref());
+                let vendor = binding.vendor.as_deref().unwrap_or(&dev.vendor);
+                let hw = build_restored_printer_profile(
+                    &dev.ip,
+                    vendor,
+                    model,
+                    binding.admin_url.as_deref(),
+                    dev.ping_alive,
+                    dev.latency_ms,
+                    installed_printers,
+                );
+                dev.device_type = "printer".to_string();
+                dev.hardware = Some(hw);
+            }
+        }
+    }
+
+    // 2. 回填本次未出现在扫描列表中的历史绑定打印机（例如休眠/关机）
+    let mut bindings: Vec<&HardwareBinding> = store
+        .hardware_bindings
+        .values()
+        .filter(|b| b.kind == "printer")
+        .collect();
+    bindings.sort_by_key(|b| b.bound_at);
+
+    for binding in bindings {
+        let norm_mac = normalize_mac(&binding.mac).unwrap_or_else(|| binding.mac.clone());
+        let already_in_devices = devices
+            .iter()
+            .any(|d| d.mac == norm_mac || (!binding.ip.is_empty() && d.ip == binding.ip));
+        if already_in_devices {
+            continue;
+        }
+
+        let meta = store.devices.get(&norm_mac);
+        let alias = meta.and_then(|m| m.alias.clone());
+        let blocked = meta.map(|m| m.blocked).unwrap_or(false);
+        let vendor = binding
+            .vendor
+            .clone()
+            .unwrap_or_else(|| "网络打印机".to_string());
+        let model = binding
+            .model
+            .clone()
+            .or_else(|| binding.system_printer_name.clone());
+        let default_name = binding
+            .label
+            .clone()
+            .or_else(|| model.clone())
+            .unwrap_or_else(|| format!("Wi-Fi 打印机 ({})", binding.ip));
+        let display_name = alias
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| default_name.clone());
+
+        let hw = build_restored_printer_profile(
+            &binding.ip,
+            &vendor,
+            model.as_deref(),
+            binding.admin_url.as_deref(),
+            false,
+            None,
+            installed_printers,
+        );
+
+        restored_macs.insert(norm_mac.clone());
+        devices.push(DeviceView {
+            ip: binding.ip.clone(),
+            mac: norm_mac,
+            display_name,
+            default_name,
+            alias,
+            vendor,
+            hostname: None,
+            device_type: "printer".to_string(),
+            is_self: false,
+            is_gateway: false,
+            is_randomized_mac: false,
+            ping_alive: false,
+            latency_ms: None,
+            trusted: true,
+            blocked,
+            is_new: false,
+            hardware: Some(hw),
+        });
+    }
+
+    // 3. 若本机系统已有网络打印机（有明确 IPv4）但尚未被上面条目覆盖，也予以展示
+    for printer in installed_printers {
+        let Some(ip) = extract_printer_ipv4(printer) else {
+            continue;
+        };
+        let already_covered = devices.iter().any(|d| {
+            d.ip == ip
+                || d.hardware
+                    .as_ref()
+                    .and_then(|h| h.system_printer_name.as_deref())
+                    == Some(printer.name.as_str())
+        });
+        if already_covered {
+            continue;
+        }
+
+        let synthetic_mac = format!("printer:{}", ip);
+        let meta = store.devices.get(&synthetic_mac);
+        let alias = meta.and_then(|m| m.alias.clone());
+        let blocked = meta.map(|m| m.blocked).unwrap_or(false);
+        let default_name = printer.name.clone();
+        let display_name = alias
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| default_name.clone());
+        let hw = build_restored_printer_profile(
+            &ip,
+            "网络打印机",
+            Some(&printer.name),
+            None,
+            false,
+            None,
+            installed_printers,
+        );
+
+        restored_macs.insert(synthetic_mac.clone());
+        devices.push(DeviceView {
+            ip,
+            mac: synthetic_mac,
+            display_name,
+            default_name,
+            alias,
+            vendor: "网络打印机".to_string(),
+            hostname: None,
+            device_type: "printer".to_string(),
+            is_self: false,
+            is_gateway: false,
+            is_randomized_mac: false,
+            ping_alive: false,
+            latency_ms: None,
+            trusted: true,
+            blocked,
+            is_new: false,
+            hardware: Some(hw),
+        });
+    }
+
+    restored_macs
+}
+
 fn perform_scan(app: &AppHandle, notify_if_new: bool) -> Result<ScanResponse, String> {
     let state = app.state::<AppState>();
     if state
@@ -172,7 +422,10 @@ fn perform_scan(app: &AppHandle, notify_if_new: bool) -> Result<ScanResponse, St
     }
 
     let result = (|| -> Result<ScanResponse, String> {
-        let raw_list: Vec<RawLanDevice> = network::scan_lan_devices();
+        let initial_store = load_store(&state.store_path);
+        let installed_printers = list_installed_printers();
+        let known_ips = collect_known_hardware_ips(&initial_store, &installed_printers);
+        let raw_list: Vec<RawLanDevice> = network::scan_lan_devices_with_hints(&known_ips);
         let mut store = load_store(&state.store_path);
         let now = now_unix_secs();
         let is_first_ever_scan = store.devices.is_empty();
@@ -231,6 +484,7 @@ fn perform_scan(app: &AppHandle, notify_if_new: bool) -> Result<ScanResponse, St
                 trusted: meta.trusted,
                 blocked: meta.blocked,
                 is_new,
+                hardware: raw.hardware,
             };
 
             if brand_new_to_store && !is_first_ever_scan {
@@ -238,6 +492,11 @@ fn perform_scan(app: &AppHandle, notify_if_new: bool) -> Result<ScanResponse, St
             }
             devices.push(view);
         }
+
+        // 先根据本次真实扫描到的已连接打印机更新持久化档案，再回填休眠/离线条目
+        sync_printer_bindings_from_scan(&mut store, &devices, now);
+        let latest_installed = list_installed_printers();
+        let restored_macs = merge_restored_printers(&mut devices, &store, &latest_installed);
 
         for new_dev in &brand_new_devices {
             store.events.insert(
@@ -257,7 +516,7 @@ fn perform_scan(app: &AppHandle, notify_if_new: bool) -> Result<ScanResponse, St
 
         let total_clients = devices
             .iter()
-            .filter(|d| !d.is_gateway && !d.blocked)
+            .filter(|d| !d.is_gateway && !d.blocked && !restored_macs.contains(&d.mac))
             .count();
         let new_count = devices.iter().filter(|d| d.is_new && !d.blocked).count();
         let ping_alive_count = devices
@@ -392,6 +651,77 @@ fn clear_network_events(state: State<'_, AppState>) -> Result<(), String> {
     let mut store = load_store(&state.store_path);
     store.events.clear();
     save_store(&state.store_path, &store)
+}
+
+#[tauri::command]
+fn probe_single_hardware(
+    ip: String,
+    mac: String,
+    vendor: String,
+    hostname: Option<String>,
+    is_gateway: bool,
+) -> Option<HardwareProfile> {
+    probe_single_hardware_profile(&ip, &mac, &vendor, hostname.as_deref(), is_gateway)
+}
+
+#[tauri::command]
+fn execute_hardware_action(
+    state: State<'_, AppState>,
+    ip: String,
+    mac: String,
+    action_id: String,
+    params: Option<Value>,
+) -> HardwareActionResult {
+    let norm = normalize_mac(&mac).unwrap_or(mac);
+    let res = execute_hardware_action_impl(&ip, &norm, &action_id, params.as_ref());
+    if res.success && action_id == "install_system_printer" {
+        let label = params
+            .as_ref()
+            .and_then(|v| v.get("display_name"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let installed = list_installed_printers();
+        let matched = find_matching_installed_printer(&installed, &ip, label.as_deref());
+        let mut store = load_store(&state.store_path);
+        let prev = store.hardware_bindings.get(&norm).cloned();
+        let now = now_unix_secs();
+        store.hardware_bindings.insert(
+            norm.clone(),
+            HardwareBinding {
+                mac: norm.clone(),
+                ip: ip.clone(),
+                adapter_id: "network_printer".to_string(),
+                kind: "printer".to_string(),
+                label: label.clone(),
+                bound_at: now,
+                vendor: prev.as_ref().and_then(|p| p.vendor.clone()),
+                model: prev
+                    .as_ref()
+                    .and_then(|p| p.model.clone())
+                    .or_else(|| matched.as_ref().map(|p| p.name.clone())),
+                system_printer_name: matched
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .or_else(|| prev.as_ref().and_then(|p| p.system_printer_name.clone())),
+                admin_url: prev.as_ref().and_then(|p| p.admin_url.clone()),
+            },
+        );
+        store.events.insert(
+            0,
+            NetworkEvent {
+                timestamp: now,
+                kind: "hardware".to_string(),
+                title: format!(
+                    "已连接打印机：{}",
+                    label.unwrap_or_else(|| ip.clone())
+                ),
+                detail: res.message.clone(),
+            },
+        );
+        store.events.truncate(50);
+        let _ = save_store(&state.store_path, &store);
+    }
+    res
 }
 
 #[tauri::command]
@@ -688,12 +1018,12 @@ fn ensure_router_session_from_app(app: &AppHandle) -> Option<RouterSession> {
 
 fn local_day_and_hhmm() -> Option<(String, String)> {
     #[cfg(target_os = "windows")]
-    let out = Command::new("powershell")
+    let out = hidden_command("powershell")
         .args(["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd HH:mm'"])
         .output()
         .ok()?;
     #[cfg(not(target_os = "windows"))]
-    let out = Command::new("date").args(["+%Y-%m-%d %H:%M"]).output().ok()?;
+    let out = hidden_command("date").args(["+%Y-%m-%d %H:%M"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -943,6 +1273,16 @@ pub fn run() {
                 }
             });
 
+            show_main_window(app.handle());
+            let show_handle = app.handle().clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(350));
+                let h = show_handle.clone();
+                let _ = show_handle.run_on_main_thread(move || {
+                    show_main_window(&h);
+                });
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -980,7 +1320,9 @@ pub fn run() {
             set_autostart,
             save_parental_rule,
             delete_parental_rule,
-            set_guest_wifi
+            set_guest_wifi,
+            probe_single_hardware,
+            execute_hardware_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1000,5 +1342,52 @@ mod tests {
         // 日间时段 14:00 ~ 16:00
         assert!(is_in_time_window("14:30", "14:00", "16:00"));
         assert!(!is_in_time_window("16:01", "14:00", "16:00"));
+    }
+
+    #[test]
+    fn test_merge_restored_printers_restores_offline_and_installed_without_duplicates() {
+        let mut store = storage::StoreData::default();
+        store.hardware_bindings.insert(
+            "a4:d7:3c:53:f6:35".to_string(),
+            HardwareBinding {
+                mac: "a4:d7:3c:53:f6:35".to_string(),
+                ip: "192.168.5.67".to_string(),
+                adapter_id: "network_printer".to_string(),
+                kind: "printer".to_string(),
+                label: Some("书房爱普生".to_string()),
+                bound_at: 1700000000,
+                vendor: Some("爱普生 Epson".to_string()),
+                model: Some("L3250 Series".to_string()),
+                system_printer_name: Some("EPSON L3250 Series".to_string()),
+                admin_url: Some("https://192.168.5.67/".to_string()),
+            },
+        );
+
+        let installed = vec![
+            InstalledPrinter {
+                name: "EPSON L3250 Series".to_string(),
+                port_name: "IP_192.168.5.67".to_string(),
+                host_address: "192.168.5.67".to_string(),
+            },
+            InstalledPrinter {
+                name: "HP LaserJet".to_string(),
+                port_name: "IP_192.168.5.88".to_string(),
+                host_address: "192.168.5.88".to_string(),
+            },
+        ];
+
+        let mut devices = Vec::new();
+        let restored = merge_restored_printers(&mut devices, &store, &installed);
+        assert_eq!(devices.len(), 2);
+        assert!(restored.contains("a4:d7:3c:53:f6:35"));
+        assert!(restored.contains("printer:192.168.5.88"));
+
+        let epson = devices.iter().find(|d| d.ip == "192.168.5.67").unwrap();
+        assert_eq!(epson.display_name, "书房爱普生");
+        assert!(!epson.is_new);
+        assert_eq!(
+            epson.hardware.as_ref().and_then(|h| h.system_installed),
+            Some(true)
+        );
     }
 }

@@ -81,6 +81,20 @@ pub fn lookup_vendor(mac: &str) -> Option<&'static str> {
         "2c:5d:34" | "3c:97:0e" | "54:ee:75" | "70:5a:0f" | "b0:60:88" | "c0:28:0b" => {
             Some("通用硬件")
         }
+        // 爱普生 Epson（无线打印机 / 投影仪）
+        "00:00:48" | "00:26:ab" | "44:d2:44" | "64:eb:8c" | "a4:d7:3c" | "b0:e8:92"
+        | "f8:d0:27" => Some("爱普生 Epson"),
+        // 惠普 HP 打印机与办公外设
+        "00:11:0a" | "00:17:a4" | "10:1f:74" | "3c:d9:2b" | "6c:c2:17" | "94:57:a5"
+        | "b4:b5:2f" | "d4:c9:ef" => Some("惠普 HP"),
+        // 佳能 Canon（打印机 / 扫描仪）
+        "00:00:85" | "00:1e:8f" | "18:0c:ac" | "34:9f:7b" | "88:87:17" | "f4:81:39" => {
+            Some("佳能 Canon")
+        }
+        // 兄弟 Brother（打印机 / 一体机）
+        "00:1b:a9" | "00:80:77" | "30:05:5c" | "3c:2a:f4" | "b4:22:00" => {
+            Some("兄弟 Brother")
+        }
         _ => None,
     }
 }
@@ -151,7 +165,13 @@ pub fn classify_device(
     }
 
     if let Some(v) = vendor {
-        let dtype = if v.contains("智能家居") || v.contains("摄像头") || v.contains("Realtek") {
+        let dtype = if v.contains("Epson")
+            || v.contains("Canon")
+            || v.contains("Brother")
+            || v.contains("HP")
+        {
+            "printer"
+        } else if v.contains("智能家居") || v.contains("摄像头") || v.contains("Realtek") {
             "iot"
         } else if v.contains("Apple") || v.contains("小米") || v.contains("华为") || v.contains("三星") {
             "phone"

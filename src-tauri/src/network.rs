@@ -1,3 +1,8 @@
+use crate::cmd_util::hidden_command;
+use crate::hardware::{
+    build_lan_hardware_profiles, resolve_device_hardware_profile, HardwareEvidence, HardwareProfile,
+};
+use crate::hardware_probe::wake_host_tcp;
 use crate::oui::{classify_device, is_randomized_mac, lookup_vendor, normalize_mac};
 use crate::router::{match_router_adapter, RouterCapabilities, RouterProbeInfo};
 use crate::ssdp::discover_ssdp_devices;
@@ -5,7 +10,6 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -52,6 +56,7 @@ pub struct RawLanDevice {
     pub is_randomized_mac: bool,
     pub ping_alive: bool,
     pub latency_ms: Option<u32>,
+    pub hardware: Option<HardwareProfile>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,7 +96,7 @@ pub struct SpeedTestResult {
 }
 
 fn run_cmd(prog: &str, args: &[&str]) -> Option<String> {
-    Command::new(prog)
+    hidden_command(prog)
         .args(args)
         .output()
         .ok()
@@ -509,17 +514,17 @@ fn read_arp_table(iface_filter: Option<&str>) -> HashMap<String, String> {
 fn ping_host(ip: &str, timeout_ms: u32) -> Option<u32> {
     let start = Instant::now();
     #[cfg(target_os = "macos")]
-    let status = Command::new("ping")
+    let status = hidden_command("ping")
         .args(["-c", "1", "-W", &timeout_ms.to_string(), ip])
         .output()
         .ok()?;
     #[cfg(target_os = "windows")]
-    let status = Command::new("ping")
+    let status = hidden_command("ping")
         .args(["-n", "1", "-w", &timeout_ms.to_string(), ip])
         .output()
         .ok()?;
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let status = Command::new("ping")
+    let status = hidden_command("ping")
         .args(["-c", "1", "-W", "1", ip])
         .output()
         .ok()?;
@@ -667,9 +672,22 @@ pub fn get_network_overview() -> NetworkOverview {
     }
 }
 
+#[allow(dead_code)]
 pub fn scan_lan_devices() -> Vec<RawLanDevice> {
+    scan_lan_devices_with_hints(&[])
+}
+
+/// 扫描局域网活跃设备，并对已知重点硬件 IP 执行二次唤醒与延长探测
+pub fn scan_lan_devices_with_hints(known_ips: &[String]) -> Vec<RawLanDevice> {
     let (iface, local_ip, gateway_ip) = detect_interface_and_gateway();
     let prefix = subnet_prefix_from_ip(&local_ip);
+    let subnet_dot = format!("{}.", prefix);
+
+    let priority_ips: HashSet<String> = known_ips
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|ip| ip.starts_with(&subnet_dot) && ip != &local_ip && ip != &gateway_ip)
+        .collect();
 
     // 与 Ping 扫描并行发起 SSDP 智能设备发现，不额外增加等待时间
     let ssdp_handle = thread::spawn(discover_ssdp_devices);
@@ -698,8 +716,35 @@ pub fn scan_lan_devices() -> Vec<RawLanDevice> {
         let _ = h.join();
     }
 
+    // 对上次记录的重点硬件（如 Wi-Fi 打印机）进行二次唤醒，避免深度休眠导致 ARP 过期漏扫
+    let missed_priority: Vec<String> = {
+        let guard = ping_results.lock().unwrap();
+        priority_ips
+            .iter()
+            .filter(|ip| !guard.contains_key(*ip))
+            .cloned()
+            .collect()
+    };
+    if !missed_priority.is_empty() {
+        let mut wake_handles = Vec::with_capacity(missed_priority.len());
+        for ip in missed_priority {
+            let res = Arc::clone(&ping_results);
+            wake_handles.push(thread::spawn(move || {
+                if let Some(ms) = ping_host(&ip, 650) {
+                    res.lock().unwrap().insert(ip, ms);
+                } else {
+                    wake_host_tcp(&ip, 900);
+                }
+            }));
+        }
+        for h in wake_handles {
+            let _ = h.join();
+        }
+    }
+
     let ping_map = ping_results.lock().unwrap().clone();
     let ssdp_map = ssdp_handle.join().unwrap_or_default();
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut arp_map = read_arp_table(Some(&iface));
 
     // 确保本机自己始终在列表中
@@ -737,6 +782,11 @@ pub fn scan_lan_devices() -> Vec<RawLanDevice> {
     }
     let mdns_map = mdns_results.lock().unwrap().clone();
 
+    let gw_mac_opt = arp_map.get(&gateway_ip).cloned();
+    let gw_fp = probe_gateway_fingerprint(&gateway_ip, gw_mac_opt.as_deref());
+    let (probe_map, installed_printers) =
+        build_lan_hardware_profiles(&ip_list, &gateway_ip, &local_ip, &priority_ips);
+
     let mut devices = Vec::new();
     for ip in ip_list {
         let Some(mac) = arp_map.get(&ip).cloned() else {
@@ -750,21 +800,83 @@ pub fn scan_lan_devices() -> Vec<RawLanDevice> {
         let (mut dtype, mut default_name, mut vendor) =
             classify_device(&ip, &mac, hostname.as_deref(), is_self, is_gateway);
 
-        if !is_self && !is_gateway {
-            if let Some(ssdp) = ssdp_map.get(&ip) {
-                if let Some(ref fname) = ssdp.friendly_name {
-                    default_name = fname.clone();
-                } else if let Some(ref model) = ssdp.model_name {
-                    default_name = model.clone();
+        let ssdp_info = if !is_self && !is_gateway {
+            ssdp_map.get(&ip)
+        } else {
+            None
+        };
+
+        if let Some(ssdp) = ssdp_info {
+            if let Some(ref fname) = ssdp.friendly_name {
+                default_name = fname.clone();
+            } else if let Some(ref model) = ssdp.model_name {
+                default_name = model.clone();
+            }
+            if let Some(hint) = ssdp.device_type_hint() {
+                if dtype == "unknown" || (dtype == "phone" && vendor.contains("未知")) || hint == "iot" {
+                    dtype = hint;
                 }
-                if let Some(hint) = ssdp.device_type_hint() {
-                    if dtype == "unknown" || (dtype == "phone" && vendor.contains("未知")) || hint == "iot" {
-                        dtype = hint;
+            }
+            if let Some(ref mfr) = ssdp.manufacturer {
+                if vendor.contains("未知") || vendor.contains("隐私") || vendor.contains("通用") {
+                    vendor = mfr.clone();
+                }
+            }
+        }
+
+        let hardware = if is_self {
+            None
+        } else {
+            let probe_info = probe_map.get(&ip);
+            let ev = HardwareEvidence {
+                ip: &ip,
+                mac: &mac,
+                vendor: &vendor,
+                hostname: hostname.as_deref(),
+                is_gateway,
+                router_brand: if is_gateway { Some(gw_fp.brand.as_str()) } else { None },
+                router_admin_url: if is_gateway { Some(gw_fp.admin_url.as_str()) } else { None },
+                router_adapter_supported: is_gateway && gw_fp.adapter_supported,
+                ping_alive,
+                latency_ms,
+                ssdp: ssdp_info,
+                probe: probe_info,
+                installed_printers: &installed_printers,
+            };
+            resolve_device_hardware_profile(&ev)
+        };
+
+        if let Some(ref hw) = hardware {
+            if !is_gateway {
+                if hw.kind == "printer" {
+                    dtype = "printer";
+                } else if hw.kind == "camera" {
+                    dtype = "camera";
+                } else if hw.kind == "smarthome" {
+                    dtype = "smarthome";
+                } else if hw.kind == "media" {
+                    dtype = "media";
+                }
+                if let Some(ref mfr) = hw.manufacturer {
+                    if vendor.contains("未知") || vendor.contains("固定") || vendor.contains("隐私") {
+                        vendor = mfr.clone();
                     }
                 }
-                if let Some(ref mfr) = ssdp.manufacturer {
-                    if vendor.contains("未知") || vendor.contains("隐私") || vendor.contains("通用") {
-                        vendor = mfr.clone();
+                if let Some(ref model) = hw.model {
+                    let has_generic = default_name.contains("设备 (#")
+                        || default_name.contains("未知")
+                        || default_name.contains("固定接入");
+                    if has_generic || hw.kind == "printer" {
+                        if let Some(ref mfr) = hw.manufacturer {
+                            let mfr_short = mfr.split_whitespace().last().unwrap_or(mfr);
+                            if model.to_lowercase().contains(&mfr_short.to_lowercase()) {
+                                default_name = model.clone();
+                            } else {
+                                default_name = format!("{} {}", mfr_short, model);
+                            }
+                        } else {
+                            default_name = model.clone();
+                        }
                     }
                 }
             }
@@ -782,6 +894,7 @@ pub fn scan_lan_devices() -> Vec<RawLanDevice> {
             is_randomized_mac: is_randomized_mac(&mac),
             ping_alive,
             latency_ms,
+            hardware,
         });
     }
 
@@ -813,7 +926,7 @@ pub fn get_saved_wifi_password(ssid: &str) -> WifiPasswordResult {
 
     #[cfg(target_os = "macos")]
     {
-        let out = Command::new("security")
+        let out = hidden_command("security")
             .args(["find-generic-password", "-wa", trimmed])
             .output();
         match out {
@@ -854,7 +967,7 @@ pub fn get_saved_wifi_password(ssid: &str) -> WifiPasswordResult {
     #[cfg(target_os = "windows")]
     {
         let arg = format!("name={}", trimmed);
-        let out = Command::new("netsh")
+        let out = hidden_command("netsh")
             .args(["wlan", "show", "profile", &arg, "key=clear"])
             .output();
         match out {
@@ -1102,7 +1215,7 @@ pub fn run_speed_test() -> SpeedTestResult {
     let mut last_err = String::from("未能连接到测速节点，请检查外网连通性");
 
     for (source_name, url) in endpoints {
-        let out = Command::new("curl")
+        let out = hidden_command("curl")
             .args([
                 "-sSL",
                 "--connect-timeout",
@@ -1177,8 +1290,13 @@ mod tests {
 
         let devs = scan_lan_devices();
         println!("DEVICES FOUND: {}", devs.len());
-        for d in devs.iter().take(10) {
-            println!("  {} | {} | {} | {} | host={:?}", d.ip, d.mac, d.default_name, d.vendor, d.hostname);
+        for d in devs.iter().take(15) {
+            let hw_info = d
+                .hardware
+                .as_ref()
+                .map(|h| format!("hw={} model={:?} svcs={:?} url={:?} status={}", h.kind, h.model, h.services, h.admin_url, h.status_text))
+                .unwrap_or_else(|| "no_hw".to_string());
+            println!("  {} | {} | {} | {} | {} | host={:?}", d.ip, d.mac, d.default_name, d.vendor, hw_info, d.hostname);
         }
         assert!(!devs.is_empty());
 

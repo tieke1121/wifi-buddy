@@ -82,7 +82,7 @@ pub fn discover_ssdp_devices() -> HashMap<String, SsdpInfo> {
                     if let Some((k, v)) = line.split_once(':') {
                         if k.trim().eq_ignore_ascii_case("location") {
                             let url = v.trim().to_string();
-                            if url.starts_with("http://") {
+                            if url.starts_with("http://") || url.starts_with("https://") {
                                 locations.entry(ip.clone()).or_insert(url);
                             }
                         }
@@ -119,36 +119,49 @@ pub fn discover_ssdp_devices() -> HashMap<String, SsdpInfo> {
 }
 
 fn fetch_upnp_xml(url: &str) -> Option<SsdpInfo> {
-    let rest = url.strip_prefix("http://")?;
-    let (host_port, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-    let addr_str = if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        format!("{}:80", host_port)
-    };
-    let addr: SocketAddr = addr_str.parse().ok()?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(550)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(450)));
-
-    let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: wifi-buddy/0.2\r\n\r\n",
-        path, host_port
-    );
-    stream.write_all(req.as_bytes()).ok()?;
-
-    let mut buf = vec![0u8; 24576];
-    let mut total = 0;
-    while total < buf.len() {
-        match stream.read(&mut buf[total..]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => total += n,
+    let text = if url.starts_with("https://") {
+        // 兼容支持 HTTPS 描述页的现代硬件（例如新型无线打印机）
+        let out = crate::cmd_util::hidden_command("curl")
+            .args(["-skL", "--connect-timeout", "1", "--max-time", "2", url])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
         }
-    }
-    let text = String::from_utf8_lossy(&buf[..total]);
+        String::from_utf8_lossy(&out.stdout).to_string()
+    } else {
+        let rest = url.strip_prefix("http://")?;
+        let (host_port, path) = match rest.find('/') {
+            Some(idx) => (&rest[..idx], &rest[idx..]),
+            None => (rest, "/"),
+        };
+        let addr_str = if host_port.contains(':') {
+            host_port.to_string()
+        } else {
+            format!("{}:80", host_port)
+        };
+        let addr: SocketAddr = addr_str.parse().ok()?;
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(550)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(450)));
+
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: wifi-buddy/0.3\r\n\r\n",
+            path, host_port
+        );
+        stream.write_all(req.as_bytes()).ok()?;
+
+        let mut buf = vec![0u8; 24576];
+        let mut total = 0;
+        while total < buf.len() {
+            match stream.read(&mut buf[total..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => total += n,
+            }
+        }
+        String::from_utf8_lossy(&buf[..total]).to_string()
+    };
+
     let friendly_name = extract_xml_tag(&text, "friendlyName");
     let manufacturer = extract_xml_tag(&text, "manufacturer");
     let model_name = extract_xml_tag(&text, "modelName");
