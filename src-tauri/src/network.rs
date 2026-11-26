@@ -1,4 +1,6 @@
 use crate::oui::{classify_device, is_randomized_mac, lookup_vendor, normalize_mac};
+use crate::router::{match_router_adapter, RouterCapabilities, RouterProbeInfo};
+use crate::ssdp::discover_ssdp_devices;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -15,7 +17,9 @@ pub struct RouterFingerprint {
     pub brand: String,
     pub admin_url: String,
     pub page_title: Option<String>,
+    pub adapter_id: Option<String>,
     pub adapter_supported: bool,
+    pub capabilities: Option<RouterCapabilities>,
     pub guide_steps: Vec<String>,
 }
 
@@ -74,6 +78,15 @@ pub struct HealthReport {
 pub struct WifiPasswordResult {
     pub ssid: String,
     pub password: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeedTestResult {
+    pub download_mbps: Option<f64>,
+    pub quality_label: String,
+    pub advice: String,
+    pub source: String,
     pub error: Option<String>,
 }
 
@@ -311,6 +324,7 @@ fn read_windows_wifi_details() -> (Option<String>, bool, Vec<String>, Option<i32
 fn probe_gateway_fingerprint(gateway_ip: &str, gateway_mac: Option<&str>) -> RouterFingerprint {
     let mac_vendor = gateway_mac.and_then(lookup_vendor);
     let mut page_title: Option<String> = None;
+    let mut http_raw = String::new();
     let mut http_hint = String::new();
 
     if let Ok(addr) = format!("{}:80", gateway_ip).parse::<SocketAddr>() {
@@ -318,7 +332,7 @@ fn probe_gateway_fingerprint(gateway_ip: &str, gateway_mac: Option<&str>) -> Rou
             let _ = stream.set_read_timeout(Some(Duration::from_millis(900)));
             let _ = stream.set_write_timeout(Some(Duration::from_millis(900)));
             let req = format!(
-                "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: wifi-buddy/0.1\r\n\r\n",
+                "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: wifi-buddy/0.2\r\n\r\n",
                 gateway_ip
             );
             if stream.write_all(req.as_bytes()).is_ok() {
@@ -330,11 +344,11 @@ fn probe_gateway_fingerprint(gateway_ip: &str, gateway_mac: Option<&str>) -> Rou
                         Ok(n) => total += n,
                     }
                 }
-                let raw = String::from_utf8_lossy(&buf[..total]).to_string();
-                http_hint = raw.to_lowercase();
+                http_raw = String::from_utf8_lossy(&buf[..total]).to_string();
+                http_hint = http_raw.to_lowercase();
                 if let Some(start) = http_hint.find("<title>") {
                     if let Some(end) = http_hint[start + 7..].find("</title>") {
-                        let t = raw[start + 7..start + 7 + end].trim().to_string();
+                        let t = http_raw[start + 7..start + 7 + end].trim().to_string();
                         if !t.is_empty() {
                             page_title = Some(t);
                         }
@@ -343,6 +357,19 @@ fn probe_gateway_fingerprint(gateway_ip: &str, gateway_mac: Option<&str>) -> Rou
             }
         }
     }
+
+    let (http_headers, http_body) = http_raw
+        .split_once("\r\n\r\n")
+        .unwrap_or((http_raw.as_str(), ""));
+
+    let probe_info = RouterProbeInfo {
+        gateway_ip,
+        mac_vendor,
+        http_status_and_headers: http_headers,
+        http_body,
+        page_title: page_title.as_deref(),
+    };
+    let matched_adapter = match_router_adapter(&probe_info);
 
     let brand = if http_hint.contains("zte") || mac_vendor == Some("中兴 ZTE") {
         "中兴 (ZTE)".to_string()
@@ -368,6 +395,12 @@ fn probe_gateway_fingerprint(gateway_ip: &str, gateway_mac: Option<&str>) -> Rou
             "查看光猫/路由器背面贴纸上的默认管理账号和密码并登录".to_string(),
             "进入「网络 / WLAN 设置」即可修改 Wi-Fi 名称与密码".to_string(),
         ]
+    } else if brand.contains("OpenWrt") {
+        vec![
+            format!("可在「路由器与守护」输入 root 密码直接绑定 OpenWrt（http://{}）", gateway_ip),
+            "如需网页设置，点击打开 LuCI 后台进入「网络 → 无线」".to_string(),
+            "建议安装 luci-mod-rpc 以开启一键改密与拉黑功能".to_string(),
+        ]
     } else {
         vec![
             format!("点击打开路由器管理页面（http://{}）", gateway_ip),
@@ -376,13 +409,24 @@ fn probe_gateway_fingerprint(gateway_ip: &str, gateway_mac: Option<&str>) -> Rou
         ]
     };
 
+    let (adapter_id, adapter_supported, capabilities) = match matched_adapter {
+        Some(adapter) => (
+            Some(adapter.id().to_string()),
+            true,
+            Some(adapter.capabilities()),
+        ),
+        None => (None, false, None),
+    };
+
     RouterFingerprint {
         gateway_ip: gateway_ip.to_string(),
         gateway_mac: gateway_mac.map(|s| s.to_string()),
         brand,
         admin_url: format!("http://{}", gateway_ip),
         page_title,
-        adapter_supported: false, // V0.1 使用通用降级引导，V0.2 接入品牌适配器
+        adapter_id,
+        adapter_supported,
+        capabilities,
         guide_steps,
     }
 }
@@ -609,13 +653,16 @@ pub fn scan_lan_devices() -> Vec<RawLanDevice> {
     let (iface, local_ip, gateway_ip) = detect_interface_and_gateway();
     let prefix = subnet_prefix_from_ip(&local_ip);
 
+    // 与 Ping 扫描并行发起 SSDP 智能设备发现，不额外增加等待时间
+    let ssdp_handle = thread::spawn(discover_ssdp_devices);
+
     // 1. 并发探测 1..254，唤醒 ARP 并记录 Ping 延迟
     let ips: Vec<String> = (1..=254).map(|i| format!("{}.{}", prefix, i)).collect();
     let queue = Arc::new(Mutex::new(ips));
     let ping_results = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
 
     let mut handles = Vec::new();
-    for _ in 0..48 {
+    for _ in 0..85 {
         let q = Arc::clone(&queue);
         let res = Arc::clone(&ping_results);
         handles.push(thread::spawn(move || loop {
@@ -624,7 +671,7 @@ pub fn scan_lan_devices() -> Vec<RawLanDevice> {
                 guard.pop()
             };
             let Some(ip) = next_ip else { break };
-            if let Some(ms) = ping_host(&ip, 250) {
+            if let Some(ms) = ping_host(&ip, 200) {
                 res.lock().unwrap().insert(ip, ms);
             }
         }));
@@ -634,6 +681,7 @@ pub fn scan_lan_devices() -> Vec<RawLanDevice> {
     }
 
     let ping_map = ping_results.lock().unwrap().clone();
+    let ssdp_map = ssdp_handle.join().unwrap_or_default();
     let mut arp_map = read_arp_table(Some(&iface));
 
     // 确保本机自己始终在列表中
@@ -652,7 +700,7 @@ pub fn scan_lan_devices() -> Vec<RawLanDevice> {
     let mdns_results = Arc::new(Mutex::new(HashMap::<String, String>::new()));
 
     let mut mdns_handles = Vec::new();
-    for _ in 0..16 {
+    for _ in 0..24 {
         let q = Arc::clone(&mdns_queue);
         let res = Arc::clone(&mdns_results);
         mdns_handles.push(thread::spawn(move || loop {
@@ -681,8 +729,28 @@ pub fn scan_lan_devices() -> Vec<RawLanDevice> {
         let hostname = mdns_map.get(&ip).cloned();
         let latency_ms = ping_map.get(&ip).copied();
         let ping_alive = latency_ms.is_some() || is_self;
-        let (dtype, default_name, vendor) =
+        let (mut dtype, mut default_name, mut vendor) =
             classify_device(&ip, &mac, hostname.as_deref(), is_self, is_gateway);
+
+        if !is_self && !is_gateway {
+            if let Some(ssdp) = ssdp_map.get(&ip) {
+                if let Some(ref fname) = ssdp.friendly_name {
+                    default_name = fname.clone();
+                } else if let Some(ref model) = ssdp.model_name {
+                    default_name = model.clone();
+                }
+                if let Some(hint) = ssdp.device_type_hint() {
+                    if dtype == "unknown" || (dtype == "phone" && vendor.contains("未知")) || hint == "iot" {
+                        dtype = hint;
+                    }
+                }
+                if let Some(ref mfr) = ssdp.manufacturer {
+                    if vendor.contains("未知") || vendor.contains("隐私") || vendor.contains("通用") {
+                        vendor = mfr.clone();
+                    }
+                }
+            }
+        }
 
         devices.push(RawLanDevice {
             ip,
@@ -971,9 +1039,115 @@ pub fn run_health_check() -> HealthReport {
     }
 }
 
+pub fn classify_speed_mbps(mbps: f64) -> (String, String) {
+    if mbps >= 100.0 {
+        (
+            "超清流畅".to_string(),
+            "看 4K 视频、开高清视频会议、下载大文件都非常轻松。".to_string(),
+        )
+    } else if mbps >= 30.0 {
+        (
+            "日常流畅".to_string(),
+            "刷短视频、看高清剧集和远程办公都很顺畅。".to_string(),
+        )
+    } else if mbps >= 10.0 {
+        (
+            "基本够用".to_string(),
+            "聊微信、看网页没问题；多人同时看高清视频可能会略卡。".to_string(),
+        )
+    } else {
+        (
+            "网速偏慢".to_string(),
+            "当前带宽较低，建议检查是否有设备正在满速下载，或靠近路由器试试。".to_string(),
+        )
+    }
+}
+
+/// 轻量真实下载测速（优先调用系统内置 curl 测量多节点下行吞吐，5 秒封顶）
+pub fn run_speed_test() -> SpeedTestResult {
+    let endpoints: [(&str, &str); 3] = [
+        (
+            "Cloudflare CDN",
+            "https://speed.cloudflare.com/__down?bytes=8388608",
+        ),
+        (
+            "阿里云开源镜像",
+            "https://mirrors.aliyun.com/ubuntu-releases/24.04.1/ubuntu-24.04.1-live-server-amd64.iso",
+        ),
+        (
+            "清华开源镜像",
+            "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/24.04.1/ubuntu-24.04.1-live-server-amd64.iso",
+        ),
+    ];
+
+    let sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut last_err = String::from("未能连接到测速节点，请检查外网连通性");
+
+    for (source_name, url) in endpoints {
+        let out = Command::new("curl")
+            .args([
+                "-sSL",
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                "5",
+                "-r",
+                "0-8388607",
+                "-o",
+                sink,
+                "-w",
+                "%{speed_download} %{size_download} %{http_code}",
+                url,
+            ])
+            .output();
+
+        if let Ok(o) = out {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let cols: Vec<&str> = stdout.split_whitespace().collect();
+            if cols.len() >= 3 {
+                let speed_bps = cols[0].parse::<f64>().unwrap_or(0.0);
+                let size_bytes = cols[1].parse::<f64>().unwrap_or(0.0);
+                let http_code = cols[2].parse::<u16>().unwrap_or(0);
+
+                if (200..400).contains(&http_code) && size_bytes >= 131_072.0 && speed_bps > 0.0 {
+                    let mbps = ((speed_bps * 8.0 / 1_000_000.0) * 10.0).round() / 10.0;
+                    let (quality_label, advice) = classify_speed_mbps(mbps);
+                    return SpeedTestResult {
+                        download_mbps: Some(mbps),
+                        quality_label,
+                        advice,
+                        source: source_name.to_string(),
+                        error: None,
+                    };
+                }
+            }
+            let err_txt = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if !err_txt.is_empty() {
+                last_err = err_txt;
+            }
+        }
+    }
+
+    SpeedTestResult {
+        download_mbps: None,
+        quality_label: "测速失败".to_string(),
+        advice: "请先运行上方「一键网络体检」确认外网宽带是否正常连通。".to_string(),
+        source: "多节点测速".to_string(),
+        error: Some(last_err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_classify_speed_mbps() {
+        assert_eq!(classify_speed_mbps(150.5).0, "超清流畅");
+        assert_eq!(classify_speed_mbps(48.0).0, "日常流畅");
+        assert_eq!(classify_speed_mbps(15.0).0, "基本够用");
+        assert_eq!(classify_speed_mbps(3.2).0, "网速偏慢");
+    }
 
     #[test]
     #[ignore]

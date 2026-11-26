@@ -1,16 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import QRCode from "qrcode";
 import {
   Activity,
   AlertTriangle,
   ArrowUpRight,
+  Ban,
   Check,
   CheckCircle2,
   Copy,
   Eye,
   EyeOff,
+  Gauge,
   KeyRound,
   Laptop,
   Lock,
@@ -20,18 +23,24 @@ import {
   Router,
   Search,
   Settings2,
-  ShieldCheck,
   Smartphone,
   Sparkles,
   Tv,
+  Wand2,
   Wifi,
   X,
 } from "lucide-react";
+import { OnboardingModal } from "./components/OnboardingModal";
+import { RouterGuardianTab } from "./components/RouterGuardianTab";
+import { evaluatePasswordStrength, generateMemorablePassword } from "./utils/password";
 import type {
+  AppPreferences,
+  AppSettings,
   DeviceView,
   HealthReport,
   NetworkOverview,
   ScanResponse,
+  SpeedTestResult,
   WifiPasswordResult,
 } from "./types";
 
@@ -78,6 +87,7 @@ function DeviceIcon({ type }: { type: string }) {
 export function App() {
   const [activeTab, setActiveTab] = useState<TabId>("devices");
   const [overview, setOverview] = useState<NetworkOverview | null>(null);
+  const [preferences, setPreferences] = useState<AppPreferences | null>(null);
   const [scan, setScan] = useState<ScanResponse | null>(null);
   const [scanning, setScanning] = useState(false);
 
@@ -88,7 +98,7 @@ export function App() {
   const [renamingDevice, setRenamingDevice] = useState<DeviceView | null>(null);
   const [renameInput, setRenameInput] = useState("");
 
-  // 分享与密码
+  // 分享与改密
   const [selectedSsid, setSelectedSsid] = useState("");
   const [wifiPassword, setWifiPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -96,30 +106,54 @@ export function App() {
   const [copied, setCopied] = useState(false);
   const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // 体检
+  // 路由器直接改密表单
+  const [newWifiSsid, setNewWifiSsid] = useState("");
+  const [newWifiPassword, setNewWifiPassword] = useState("");
+  const [showNewWifiPw, setShowNewWifiPw] = useState(false);
+  const [confirmingWifiSave, setConfirmingWifiSave] = useState(false);
+  const [updatingWifi, setUpdatingWifi] = useState(false);
+
+  // 体检与测速
   const [health, setHealth] = useState<HealthReport | null>(null);
   const [checkingHealth, setCheckingHealth] = useState(false);
+  const [speedResult, setSpeedResult] = useState<SpeedTestResult | null>(null);
+  const [testingSpeed, setTestingSpeed] = useState(false);
 
   // Toast
   const [toast, setToast] = useState<string | null>(null);
-
   const notify = (msg: string) => setToast(msg);
 
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(null), 3500);
+    const t = setTimeout(() => setToast(null), 3800);
     return () => clearTimeout(t);
   }, [toast]);
+
+  async function refreshPreferences() {
+    try {
+      const prefs = await invoke<AppPreferences>("get_app_preferences");
+      setPreferences(prefs);
+    } catch {
+      // ignore
+    }
+  }
 
   async function loadOverviewAndScan() {
     setScanning(true);
     try {
-      const ov = await invoke<NetworkOverview>("get_network_overview");
+      const [ov, prefs] = await Promise.all([
+        invoke<NetworkOverview>("get_network_overview"),
+        invoke<AppPreferences>("get_app_preferences"),
+      ]);
       setOverview(ov);
+      setPreferences(prefs);
       const initialSsid = ov.ssid || ov.preferred_ssids[0] || "";
       setSelectedSsid((prev) => prev || initialSsid);
+      setNewWifiSsid((prev) => prev || initialSsid);
+
       const res = await invoke<ScanResponse>("scan_devices");
       setScan(res);
+      setPreferences((prev) => (prev ? { ...prev, events: res.events } : prev));
     } catch (e) {
       notify(`读取网络信息失败：${String(e)}`);
     } finally {
@@ -129,6 +163,22 @@ export function App() {
 
   useEffect(() => {
     loadOverviewAndScan();
+
+    let unlisten: (() => void) | undefined;
+    listen<ScanResponse>("lan-scan-completed", (event) => {
+      const res = event.payload;
+      setScan(res);
+      setPreferences((prev) => (prev ? { ...prev, events: res.events } : prev));
+      if (res.brand_new_devices.length > 0) {
+        notify(`后台巡检发现 ${res.brand_new_devices.length} 台新设备上线`);
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      if (unlisten) unlisten();
+    };
   }, []);
 
   useEffect(() => {
@@ -150,6 +200,7 @@ export function App() {
     try {
       const res = await invoke<ScanResponse>("scan_devices");
       setScan(res);
+      setPreferences((prev) => (prev ? { ...prev, events: res.events } : prev));
       notify(`扫描完成，当前共有 ${res.total_clients} 台终端在线`);
     } catch (e) {
       notify(`扫描出错：${String(e)}`);
@@ -158,18 +209,22 @@ export function App() {
     }
   }
 
+  async function saveAliasByMac(mac: string, alias: string) {
+    await invoke("save_device_meta", {
+      mac,
+      alias,
+      trusted: true,
+      blocked: null,
+    });
+    const res = await invoke<ScanResponse>("scan_devices");
+    setScan(res);
+  }
+
   async function handleSaveAlias() {
     if (!renamingDevice) return;
     try {
-      await invoke("save_device_meta", {
-        mac: renamingDevice.mac,
-        alias: renameInput,
-        trusted: true,
-        blocked: null,
-      });
+      await saveAliasByMac(renamingDevice.mac, renameInput);
       setRenamingDevice(null);
-      const res = await invoke<ScanResponse>("scan_devices");
-      setScan(res);
       notify(`已将设备备注为「${renameInput.trim() || renamingDevice.default_name}」`);
     } catch (e) {
       notify(`保存失败：${String(e)}`);
@@ -208,6 +263,27 @@ export function App() {
     }
   }
 
+  async function handleRouterBlock(d: DeviceView, block: boolean) {
+    try {
+      const msg = await invoke<string>("router_block_device", {
+        mac: d.mac,
+        block,
+      });
+      await invoke("save_device_meta", {
+        mac: d.mac,
+        alias: null,
+        trusted: null,
+        blocked: block,
+      });
+      const res = await invoke<ScanResponse>("scan_devices");
+      setScan(res);
+      await refreshPreferences();
+      notify(msg);
+    } catch (e) {
+      notify(String(e));
+    }
+  }
+
   async function handleReadSavedPassword() {
     if (!selectedSsid.trim()) {
       notify("请先选择或输入当前的 Wi-Fi 名称");
@@ -232,6 +308,33 @@ export function App() {
     }
   }
 
+  async function handleApplyRouterWifi() {
+    if (!newWifiSsid.trim()) {
+      notify("请填写新的 Wi-Fi 名称");
+      return;
+    }
+    if (newWifiPassword.length < 8) {
+      notify("Wi-Fi 密码至少需要 8 位");
+      return;
+    }
+    setUpdatingWifi(true);
+    try {
+      const msg = await invoke<string>("update_router_wifi", {
+        ssid: newWifiSsid.trim(),
+        password: newWifiPassword,
+      });
+      setSelectedSsid(newWifiSsid.trim());
+      setWifiPassword(newWifiPassword);
+      setConfirmingWifiSave(false);
+      await refreshPreferences();
+      notify(msg);
+    } catch (e) {
+      notify(String(e));
+    } finally {
+      setUpdatingWifi(false);
+    }
+  }
+
   async function handleRunHealth() {
     setCheckingHealth(true);
     try {
@@ -244,6 +347,23 @@ export function App() {
     }
   }
 
+  async function handleRunSpeedTest() {
+    setTestingSpeed(true);
+    try {
+      const res = await invoke<SpeedTestResult>("run_speed_test");
+      setSpeedResult(res);
+      if (res.error) {
+        notify(res.error);
+      } else {
+        notify(`测速完成：当前下行约 ${res.download_mbps} Mbps`);
+      }
+    } catch (e) {
+      notify(`测速失败：${String(e)}`);
+    } finally {
+      setTestingSpeed(false);
+    }
+  }
+
   async function handleOpenRouterAdmin() {
     if (!overview?.router.admin_url) return;
     try {
@@ -251,6 +371,35 @@ export function App() {
     } catch (e) {
       notify(`打开路由器后台失败：${String(e)}`);
     }
+  }
+
+  async function handleUpdateSettings(next: AppSettings) {
+    try {
+      const saved = await invoke<AppSettings>("update_app_settings", { settings: next });
+      setPreferences((prev) => (prev ? { ...prev, settings: saved } : prev));
+      notify("守护设置已保存");
+    } catch (e) {
+      notify(`保存设置失败：${String(e)}`);
+    }
+  }
+
+  async function handleClearEvents() {
+    try {
+      await invoke("clear_network_events");
+      setPreferences((prev) => (prev ? { ...prev, events: [] } : prev));
+      notify("已清空网络动态记录");
+    } catch (e) {
+      notify(`清空失败：${String(e)}`);
+    }
+  }
+
+  async function handleFinishOnboarding() {
+    try {
+      await invoke("mark_onboarding_done");
+    } catch {
+      // ignore
+    }
+    setPreferences((prev) => (prev ? { ...prev, onboarding_done: true } : prev));
   }
 
   function handleCopyWifiCard() {
@@ -309,31 +458,41 @@ export function App() {
   );
 
   const sigMeta = getSignalMeta(overview?.signal_dbm ?? null);
+  const newPwStrength = evaluatePasswordStrength(newWifiPassword);
+  const isRouterBound = Boolean(
+    preferences?.router_connected || preferences?.has_saved_router_password
+  );
+  const canRouterBlock = Boolean(
+    isRouterBound && overview?.router.capabilities?.supports_block_mac
+  );
+  const canRouterWifi = Boolean(
+    overview?.router.adapter_supported && overview?.router.capabilities?.supports_wifi_config
+  );
 
   const tabMeta: Record<TabId, { title: string; subtitle: string }> = {
     devices: {
       title: "谁在用我的网",
       subtitle: overview
-        ? `子网 ${overview.subnet_cidr} · 已为你自动识别品牌与隐私随机地址`
+        ? `子网 ${overview.subnet_cidr} · 已结合 ARP / mDNS / SSDP 自动识别智能设备`
         : "正在扫描局域网活跃设备...",
     },
     share: {
       title: "扫码连网与改密码",
-      subtitle: "读取本机保存的密码生成亲友二维码，或一键前往路由器修改密码",
+      subtitle: "读取本机保存的密码生成亲友二维码，或通过路由器适配器一键修改密码",
     },
     health: {
       title: "一键网络体检",
-      subtitle: "快速定位卡顿源头：信号弱、带宽被占还是外网宽带故障",
+      subtitle: "三段式排查卡顿源头 + 多节点真实下行测速（Mbps）",
     },
     router: {
-      title: "路由器与版本说明",
-      subtitle: "自动识别网关型号，了解 V0.1 通用能力与后续控制规划",
+      title: "路由器与守护",
+      subtitle: "中兴 / OpenWrt 适配器绑定、后台定时巡检与最近网络动态",
     },
   };
 
   return (
     <div className="h-screen w-screen flex bg-[#f4f5f7] text-slate-900 dark:bg-[#0d0f14] dark:text-zinc-100 select-none overflow-hidden">
-      {/* 左侧 macOS 风格边栏 */}
+      {/* 左侧边栏 */}
       <aside className="w-60 shrink-0 border-r border-slate-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/70 backdrop-blur-xl flex flex-col justify-between p-4">
         <div className="space-y-6">
           {/* Brand */}
@@ -342,7 +501,9 @@ export function App() {
               <Wifi className="w-5 h-5" />
             </div>
             <div className="min-w-0">
-              <div className="text-sm font-bold tracking-tight truncate">Wi-Fi 小管家</div>
+              <div className="text-sm font-bold tracking-tight truncate">
+                Wi-Fi 小管家
+              </div>
               <div className="text-[11px] text-slate-500 dark:text-zinc-400 truncate">
                 {overview?.router.brand ?? "正在识别网络..."}
               </div>
@@ -357,12 +518,11 @@ export function App() {
                   id: "devices",
                   label: "谁在用我的网",
                   icon: Radar,
-                  badge:
-                    (scan?.new_count ?? 0) > 0 ? `${scan?.new_count}` : null,
+                  badge: (scan?.new_count ?? 0) > 0 ? `${scan?.new_count}` : null,
                 },
                 { id: "share", label: "扫码连与改密码", icon: KeyRound, badge: null },
                 { id: "health", label: "一键网络体检", icon: Activity, badge: null },
-                { id: "router", label: "路由器与说明", icon: Settings2, badge: null },
+                { id: "router", label: "路由器与守护", icon: Settings2, badge: null },
               ] as const
             ).map((item) => {
               const Icon = item.icon;
@@ -421,7 +581,7 @@ export function App() {
             </div>
           </div>
           <div className="pt-2 border-t border-slate-200/70 dark:border-zinc-800 flex items-center justify-between text-[11px] text-slate-500 dark:text-zinc-400">
-            <span>网关</span>
+            <span>{preferences?.settings.auto_scan_enabled ? "后台守护中" : "网关"}</span>
             <span className="font-mono text-slate-700 dark:text-zinc-300">
               {overview?.router.gateway_ip ?? "--"}
             </span>
@@ -431,7 +591,6 @@ export function App() {
 
       {/* 右侧主内容区 */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        {/* 顶部标题栏 */}
         <header className="h-16 shrink-0 px-6 border-b border-slate-200/80 dark:border-zinc-800/80 bg-white/70 dark:bg-zinc-900/50 backdrop-blur-md flex items-center justify-between gap-4">
           <div className="min-w-0">
             <h1 className="text-base font-bold tracking-tight truncate">
@@ -454,23 +613,49 @@ export function App() {
               </button>
             )}
             {activeTab === "health" && (
-              <button
-                onClick={handleRunHealth}
-                disabled={checkingHealth}
-                className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 shadow-xs shadow-blue-600/20 transition cursor-pointer"
-              >
-                <Activity className={`w-3.5 h-3.5 ${checkingHealth ? "animate-pulse" : ""}`} />
-                {checkingHealth ? "正在体检..." : "开始体检"}
-              </button>
+              <>
+                <button
+                  onClick={handleRunSpeedTest}
+                  disabled={testingSpeed}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 hover:bg-slate-50 dark:hover:bg-zinc-800 disabled:opacity-60 transition cursor-pointer"
+                >
+                  <Gauge className={`w-3.5 h-3.5 ${testingSpeed ? "animate-spin" : ""}`} />
+                  {testingSpeed ? "测速中..." : "测真实网速"}
+                </button>
+                <button
+                  onClick={handleRunHealth}
+                  disabled={checkingHealth}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 shadow-xs shadow-blue-600/20 transition cursor-pointer"
+                >
+                  <Activity className={`w-3.5 h-3.5 ${checkingHealth ? "animate-pulse" : ""}`} />
+                  {checkingHealth ? "正在体检..." : "开始体检"}
+                </button>
+              </>
             )}
           </div>
         </header>
 
-        {/* 内容滚动区 */}
         <main className="flex-1 overflow-y-auto p-6 space-y-5 select-text">
           {/* TAB 1: 设备雷达 */}
           {activeTab === "devices" && (
             <>
+              {(scan?.new_count ?? 0) > 0 && (
+                <div className="rounded-2xl bg-amber-50/90 dark:bg-amber-500/10 border border-amber-200/80 dark:border-amber-500/25 px-4 py-3 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 text-xs text-amber-900 dark:text-amber-200">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
+                    <span>
+                      发现 <strong>{scan?.new_count}</strong> 台未备注的陌生设备。若是家人手机开启了“私有无线局域网地址”，点「备注」或「标为熟人」即可不再提醒。
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setFilter("new")}
+                    className="text-xs font-medium px-2.5 py-1 rounded-lg bg-amber-200/70 hover:bg-amber-200 text-amber-900 dark:bg-amber-500/25 dark:text-amber-200 shrink-0 cursor-pointer"
+                  >
+                    只看新设备
+                  </button>
+                </div>
+              )}
+
               {/* 3 张统计 Bento 卡片 */}
               <div className="grid grid-cols-3 gap-4">
                 <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-4 shadow-2xs">
@@ -524,7 +709,6 @@ export function App() {
               {/* 列表卡片 */}
               <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl shadow-2xs overflow-hidden">
                 <div className="px-4 py-3 border-b border-slate-100 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-3">
-                  {/* 分段筛选 */}
                   <div className="inline-flex items-center p-1 rounded-xl bg-slate-100 dark:bg-zinc-950 gap-0.5">
                     {(
                       [
@@ -532,7 +716,7 @@ export function App() {
                         ["new", "陌生设备"],
                         ["personal", "手机/电脑"],
                         ["iot", "固定/家居"],
-                        ["blocked", "已隐藏"],
+                        ["blocked", "已隐藏/拉黑"],
                       ] as [DeviceFilter, string][]
                     ).map(([id, label]) => (
                       <button
@@ -549,7 +733,6 @@ export function App() {
                     ))}
                   </div>
 
-                  {/* 搜索与技术开关 */}
                   <div className="flex items-center gap-3">
                     <div className="relative">
                       <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
@@ -578,12 +761,11 @@ export function App() {
                   </div>
                 </div>
 
-                {/* 设备行 */}
                 <div className="divide-y divide-slate-100 dark:divide-zinc-800/80">
                   {scanning && !scan ? (
                     <div className="py-14 flex flex-col items-center justify-center gap-2 text-xs text-slate-500">
                       <RefreshCw className="w-5 h-5 animate-spin text-blue-500" />
-                      <span>正在探测局域网设备，请稍候...</span>
+                      <span>正在并发探测局域网设备与 SSDP 智能家居...</span>
                     </div>
                   ) : filteredDevices.length === 0 ? (
                     <div className="py-14 text-center text-xs text-slate-500">
@@ -686,6 +868,16 @@ export function App() {
                                   备注
                                 </button>
                               )}
+                              {!d.is_self && !d.is_gateway && canRouterBlock && (
+                                <button
+                                  onClick={() => handleRouterBlock(d, true)}
+                                  className="inline-flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-lg text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-500/10 transition cursor-pointer"
+                                  title="通过路由器无线黑名单拉黑该设备"
+                                >
+                                  <Ban className="w-3 h-3" />
+                                  拉黑
+                                </button>
+                              )}
                               {!d.is_self && !d.is_gateway && (
                                 <button
                                   onClick={() => handleToggleHidden(d, true)}
@@ -696,12 +888,22 @@ export function App() {
                               )}
                             </>
                           ) : (
-                            <button
-                              onClick={() => handleToggleHidden(d, false)}
-                              className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 transition cursor-pointer"
-                            >
-                              恢复显示
-                            </button>
+                            <div className="flex items-center gap-1.5">
+                              {canRouterBlock && (
+                                <button
+                                  onClick={() => handleRouterBlock(d, false)}
+                                  className="text-xs px-2.5 py-1.5 rounded-lg bg-blue-50 text-blue-600 hover:bg-blue-100 dark:bg-blue-500/15 dark:text-blue-300 transition cursor-pointer"
+                                >
+                                  解除拉黑
+                                </button>
+                              )}
+                              <button
+                                onClick={() => handleToggleHidden(d, false)}
+                                className="text-xs px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 transition cursor-pointer"
+                              >
+                                恢复显示
+                              </button>
+                            </div>
                           )}
                         </div>
                       </div>
@@ -800,37 +1002,159 @@ export function App() {
                   </div>
                 </div>
 
-                {/* 改密码引导卡 */}
-                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-3 shadow-2xs">
+                {/* 修改路由器 Wi-Fi 密码卡片（适配型号支持一键修改 + 强度检测 + 好记强密码生成器） */}
+                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-3.5 shadow-2xs">
                   <div className="flex items-center justify-between">
                     <h3 className="text-sm font-bold">修改路由器 Wi-Fi 密码</h3>
                     <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-zinc-300">
                       {overview?.router.brand ?? "路由器"}
                     </span>
                   </div>
-                  <div className="space-y-2 pt-1">
-                    {(overview?.router.guide_steps ?? []).map((step, i) => (
-                      <div key={i} className="flex items-start gap-2.5 text-xs text-slate-600 dark:text-zinc-300">
-                        <span className="w-5 h-5 rounded-full bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400 font-semibold flex items-center justify-center shrink-0 text-[11px]">
-                          {i + 1}
-                        </span>
-                        <span className="pt-0.5 leading-relaxed">{step}</span>
+
+                  {canRouterWifi && isRouterBound ? (
+                    <div className="space-y-3 pt-1">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                            新 Wi-Fi 名称
+                          </label>
+                          <input
+                            value={newWifiSsid}
+                            onChange={(e) => setNewWifiSsid(e.target.value)}
+                            placeholder="例如 MyHome_5G"
+                            className="w-full text-xs px-3 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950 focus:outline-none focus:border-blue-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                            新 Wi-Fi 密码（至少 8 位）
+                          </label>
+                          <div className="flex gap-1.5">
+                            <input
+                              type={showNewWifiPw ? "text" : "password"}
+                              value={newWifiPassword}
+                              onChange={(e) => setNewWifiPassword(e.target.value)}
+                              placeholder="输入新密码"
+                              className="flex-1 min-w-0 text-xs px-3 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950 focus:outline-none focus:border-blue-500"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowNewWifiPw((v) => !v)}
+                              className="px-2.5 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 cursor-pointer"
+                            >
+                              {showNewWifiPw ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                            </button>
+                          </div>
+                        </div>
                       </div>
-                    ))}
-                  </div>
-                  <div className="pt-1">
-                    <button
-                      onClick={handleOpenRouterAdmin}
-                      className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 transition cursor-pointer"
-                    >
-                      <span>打开路由器后台 ({overview?.router.admin_url})</span>
-                      <ArrowUpRight className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
+
+                      {/* 密码强度条 + 生成器 */}
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className={newPwStrength.textClass}>
+                            密码强度：{newPwStrength.label}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const pw = generateMemorablePassword();
+                              setNewWifiPassword(pw);
+                              setShowNewWifiPw(true);
+                            }}
+                            className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline cursor-pointer font-medium"
+                          >
+                            <Wand2 className="w-3 h-3" />
+                            生成好记强密码
+                          </button>
+                        </div>
+                        <div className="h-1.5 rounded-full bg-slate-100 dark:bg-zinc-800 overflow-hidden">
+                          <div
+                            className={`h-full transition-all duration-300 ${newPwStrength.barClass}`}
+                            style={{ width: `${newPwStrength.percent}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      {!confirmingWifiSave ? (
+                        <div className="flex items-center gap-2 pt-1 flex-wrap">
+                          <button
+                            onClick={() => setConfirmingWifiSave(true)}
+                            disabled={!newWifiSsid.trim() || newWifiPassword.length < 8}
+                            className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition cursor-pointer"
+                          >
+                            一键修改路由器密码
+                          </button>
+                          <button
+                            onClick={handleOpenRouterAdmin}
+                            className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 transition cursor-pointer"
+                          >
+                            <span>网页后台</span>
+                            <ArrowUpRight className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="rounded-xl bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/25 p-3 space-y-2">
+                          <div className="text-xs text-amber-900 dark:text-amber-200 font-medium">
+                            修改后家里所有手机、电视和智能设备需要用新密码重新连一次，确定立即应用吗？
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={handleApplyRouterWifi}
+                              disabled={updatingWifi}
+                              className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 cursor-pointer"
+                            >
+                              {updatingWifi ? "正在提交..." : "确认修改并同步二维码"}
+                            </button>
+                            <button
+                              onClick={() => setConfirmingWifiSave(false)}
+                              className="text-xs px-2.5 py-1.5 rounded-lg text-slate-500 hover:bg-white/60 cursor-pointer"
+                            >
+                              取消
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <>
+                      {canRouterWifi && !isRouterBound && (
+                        <div className="text-xs rounded-xl bg-blue-50/70 dark:bg-blue-500/10 border border-blue-200/60 dark:border-blue-500/20 p-3 flex items-center justify-between gap-3">
+                          <span className="text-slate-700 dark:text-zinc-200">
+                            你的路由器已支持直接改密！先绑定管理员密码即可在这里一键修改。
+                          </span>
+                          <button
+                            onClick={() => setActiveTab("router")}
+                            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 shrink-0 cursor-pointer"
+                          >
+                            去绑定
+                          </button>
+                        </div>
+                      )}
+                      <div className="space-y-2 pt-1">
+                        {(overview?.router.guide_steps ?? []).map((step, i) => (
+                          <div key={i} className="flex items-start gap-2.5 text-xs text-slate-600 dark:text-zinc-300">
+                            <span className="w-5 h-5 rounded-full bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400 font-semibold flex items-center justify-center shrink-0 text-[11px]">
+                              {i + 1}
+                            </span>
+                            <span className="pt-0.5 leading-relaxed">{step}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="pt-1">
+                        <button
+                          onClick={handleOpenRouterAdmin}
+                          className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800 transition cursor-pointer"
+                        >
+                          <span>打开路由器后台 ({overview?.router.admin_url})</span>
+                          <ArrowUpRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
 
-              {/* 右侧：精致的分享二维码通行卡 */}
+              {/* 右侧：分享二维码通行卡 */}
               <div className="lg:col-span-5">
                 <div className="bg-gradient-to-b from-white to-slate-50 dark:from-zinc-900 dark:to-zinc-950 border border-slate-200/80 dark:border-zinc-800 rounded-3xl p-6 flex flex-col items-center text-center space-y-4 shadow-sm">
                   <div className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 px-3 py-1 rounded-full">
@@ -863,11 +1187,11 @@ export function App() {
             </div>
           )}
 
-          {/* TAB 3: 一键网络体检 */}
+          {/* TAB 3: 一键网络体检 + 带宽测速 */}
           {activeTab === "health" && (
             <div className="space-y-5">
               {!health ? (
-                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-12 flex flex-col items-center text-center space-y-4 shadow-2xs">
+                <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-10 flex flex-col items-center text-center space-y-4 shadow-2xs">
                   <div className="w-14 h-14 rounded-2xl bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400 flex items-center justify-center">
                     <Activity className="w-7 h-7" />
                   </div>
@@ -877,18 +1201,27 @@ export function App() {
                       会分别检测「本机到路由器信号延迟」和「路由器到外部宽带连通性」，直接告诉你该怎么解决。
                     </p>
                   </div>
-                  <button
-                    onClick={handleRunHealth}
-                    disabled={checkingHealth}
-                    className="inline-flex items-center gap-2 text-xs font-semibold px-5 py-2.5 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 shadow-sm shadow-blue-600/20 transition cursor-pointer"
-                  >
-                    <Activity className={`w-4 h-4 ${checkingHealth ? "animate-pulse" : ""}`} />
-                    {checkingHealth ? "正在检测中..." : "立即开始体检"}
-                  </button>
+                  <div className="flex items-center gap-2.5 flex-wrap justify-center">
+                    <button
+                      onClick={handleRunHealth}
+                      disabled={checkingHealth}
+                      className="inline-flex items-center gap-2 text-xs font-semibold px-5 py-2.5 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 shadow-sm shadow-blue-600/20 transition cursor-pointer"
+                    >
+                      <Activity className={`w-4 h-4 ${checkingHealth ? "animate-pulse" : ""}`} />
+                      {checkingHealth ? "正在检测中..." : "立即开始体检"}
+                    </button>
+                    <button
+                      onClick={handleRunSpeedTest}
+                      disabled={testingSpeed}
+                      className="inline-flex items-center gap-2 text-xs font-semibold px-5 py-2.5 rounded-xl border border-slate-200 dark:border-zinc-700 hover:bg-slate-50 dark:hover:bg-zinc-800 disabled:opacity-60 transition cursor-pointer"
+                    >
+                      <Gauge className={`w-4 h-4 ${testingSpeed ? "animate-spin" : ""}`} />
+                      {testingSpeed ? "测速中..." : "测一下真实网速"}
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <>
-                  {/* 结论横幅 */}
                   <div
                     className={`rounded-2xl p-5 border flex items-start gap-4 shadow-2xs ${
                       health.overall_status === "good"
@@ -919,7 +1252,6 @@ export function App() {
                     </div>
                   </div>
 
-                  {/* 三步卡片 */}
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                     {health.steps.map((s) => (
                       <div
@@ -948,68 +1280,72 @@ export function App() {
                   </div>
                 </>
               )}
+
+              {/* 真实带宽测速卡 */}
+              <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-2xs">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <Gauge className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                    <h3 className="text-sm font-bold">真实下载带宽测速</h3>
+                    {speedResult && (
+                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-300 font-medium">
+                        {speedResult.quality_label}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-500 dark:text-zinc-400">
+                    {speedResult
+                      ? `${speedResult.advice}（节点：${speedResult.source}）`
+                      : "测试真实下行带宽（Mbps），直观告诉你当前网络适不适合看 4K 视频或开会。"}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-4 shrink-0">
+                  {speedResult?.download_mbps !== null && speedResult?.download_mbps !== undefined && (
+                    <div className="text-right">
+                      <div className="text-2xl font-bold tabular-nums tracking-tight text-blue-600 dark:text-blue-400">
+                        {speedResult.download_mbps}
+                        <span className="text-xs font-normal text-slate-400 ml-1">Mbps</span>
+                      </div>
+                    </div>
+                  )}
+                  <button
+                    onClick={handleRunSpeedTest}
+                    disabled={testingSpeed}
+                    className="inline-flex items-center gap-1.5 text-xs font-medium px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 disabled:opacity-60 transition cursor-pointer"
+                  >
+                    <Gauge className={`w-3.5 h-3.5 ${testingSpeed ? "animate-spin" : ""}`} />
+                    {testingSpeed ? "测速中 (约 5 秒)..." : speedResult ? "重新测速" : "开始测速"}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 
-          {/* TAB 4: 路由器与说明 */}
+          {/* TAB 4: 路由器与守护 */}
           {activeTab === "router" && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-              <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-4 shadow-2xs">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-sm font-bold">当前路由器识别信息</h2>
-                  <ShieldCheck className="w-4 h-4 text-emerald-500" />
-                </div>
-
-                <div className="text-xs divide-y divide-slate-100 dark:divide-zinc-800">
-                  <div className="py-2.5 flex justify-between">
-                    <span className="text-slate-500 dark:text-zinc-400">识别品牌</span>
-                    <span className="font-semibold">{overview?.router.brand ?? "--"}</span>
-                  </div>
-                  <div className="py-2.5 flex justify-between">
-                    <span className="text-slate-500 dark:text-zinc-400">管理后台</span>
-                    <span className="font-mono">{overview?.router.admin_url ?? "--"}</span>
-                  </div>
-                  <div className="py-2.5 flex justify-between">
-                    <span className="text-slate-500 dark:text-zinc-400">网关 MAC</span>
-                    <span className="font-mono">{overview?.router.gateway_mac ?? "--"}</span>
-                  </div>
-                  <div className="py-2.5 flex justify-between">
-                    <span className="text-slate-500 dark:text-zinc-400">页面标题</span>
-                    <span className="truncate max-w-44">
-                      {overview?.router.page_title ?? "默认管理页"}
-                    </span>
-                  </div>
-                </div>
-
-                <button
-                  onClick={handleOpenRouterAdmin}
-                  className="inline-flex items-center gap-1.5 text-xs font-medium px-3.5 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 transition cursor-pointer"
-                >
-                  <span>在浏览器打开后台</span>
-                  <ArrowUpRight className="w-3.5 h-3.5" />
-                </button>
-              </div>
-
-              <div className="bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 rounded-2xl p-5 space-y-3 shadow-2xs">
-                <h2 className="text-sm font-bold">版本路线（V0.1 → V0.2）</h2>
-                <p className="text-xs text-slate-500 dark:text-zinc-400 leading-relaxed">
-                  当前是 V0.1 通用基础版：无需登录路由器即可看清局域网设备、做陌生设备备注、读本机密码扫码分享及网络体检。
-                </p>
-                <div className="rounded-xl bg-slate-50 dark:bg-zinc-950 border border-slate-200/70 dark:border-zinc-800 p-3.5 space-y-2 text-xs text-slate-600 dark:text-zinc-300">
-                  <div className="font-semibold text-slate-800 dark:text-zinc-100">
-                    即将上线（V0.2）：
-                  </div>
-                  <ul className="space-y-1">
-                    <li>• 对接中兴 / 小米 / TP-Link / OpenWrt 一键改密与踢人</li>
-                    <li>• 后台定时静默巡检 + 新设备上线桌面弹窗提醒</li>
-                    <li>• 真实带宽测速（Mbps）与智能家居 SSDP 设备识别</li>
-                  </ul>
-                </div>
-              </div>
-            </div>
+            <RouterGuardianTab
+              overview={overview}
+              preferences={preferences}
+              onOpenRouterAdmin={handleOpenRouterAdmin}
+              onUpdateSettings={handleUpdateSettings}
+              onClearEvents={handleClearEvents}
+              onRefreshPreferences={refreshPreferences}
+              notify={notify}
+            />
           )}
         </main>
       </div>
+
+      {/* 首次启动 30 秒引导向导 */}
+      {preferences && !preferences.onboarding_done && (
+        <OnboardingModal
+          overview={overview}
+          devices={scan?.devices ?? []}
+          onSaveAlias={saveAliasByMac}
+          onFinish={handleFinishOnboarding}
+        />
+      )}
 
       {/* 底部浮动 Toast */}
       {toast && (
